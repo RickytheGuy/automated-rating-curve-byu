@@ -3,7 +3,7 @@ import logging
 from datetime import datetime
 
 from arc import LOG
-from arc.Automated_Rating_Curve_Generator import main, get_parameter_name
+from arc.Automated_Rating_Curve_Generator import main
 from arc.Curve2Flood import Curve2Flood_MainFunction
 
 __all__ = ['Arc']
