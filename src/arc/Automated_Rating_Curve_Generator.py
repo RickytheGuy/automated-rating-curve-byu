@@ -221,13 +221,15 @@ def line_slope_from_dem(line_geom: LineString, dm_elevation: np.ndarray, dem_geo
         z_start, dist_start = sample_line_for_valid_z(
             line_geom,
             dm_elevation,
-            xy_to_rowcol
+            xy_to_rowcol,
+            length_m,
         )
 
         z_end, dist_from_end = sample_line_for_valid_z(
             LineString(list(line_geom.coords)[::-1]),
             dm_elevation,
-            xy_to_rowcol
+            xy_to_rowcol,
+            length_m,
         )
 
         if np.isnan(z_start) or np.isnan(z_end):
@@ -672,7 +674,10 @@ def read_flow_file(s_flow_file_name: str, s_flow_id: str, s_flow_baseflow: str, 
         Mapping ``reach_id -> {baseflow_column: value, qmax_column: value}``.
 
     """
-    df = pd.read_csv(s_flow_file_name)
+    if s_flow_file_name.endswith('.parquet'):
+        df = pd.read_parquet(s_flow_file_name)
+    else:
+        df = pd.read_csv(s_flow_file_name)
     return df.set_index(s_flow_id)[[s_flow_baseflow, s_flow_qmax]].to_dict(orient='index')
 
 @vectorize(target='cpu', cache=True)
@@ -992,7 +997,10 @@ def read_manning_table(s_manning_path: str, land_cover_array: np.ndarray, proces
     """
 
     # Open and read the input file
-    df = pd.read_csv(s_manning_path, sep='\t')
+    if s_manning_path.endswith('.parquet'):
+        df = pd.read_parquet(s_manning_path)
+    else:
+        df = pd.read_csv(s_manning_path, sep='\t')
 
     # Create a lookup array for the Manning's n values
     # This is the fastest way to reclassify the values in the input array
@@ -1174,7 +1182,7 @@ def dict_stream_slopes_from_endpoints(dm_stream, dem_geotransform, dem_projectio
     pbar_slopes = tqdm.tqdm(unique_stream_ids, disable=quiet)
     dict_stream_slopes = {}
     for stream_id in pbar_slopes:
-        gdf_StrmSHP_filtered: gpd.GeoDataFrame = gdf_StrmSHP[gdf_StrmSHP[s_flow_file_id]==stream_id]
+        gdf_StrmSHP_filtered: gpd.GeoDataFrame = gdf_StrmSHP[gdf_StrmSHP['LINKNO']==stream_id]
         utm_crs = gdf_StrmSHP_filtered.estimate_utm_crs()
         gdf_utm = gdf_StrmSHP_filtered.to_crs(utm_crs)
         StrmSHP_geom = gdf_StrmSHP_filtered.to_crs(dem_projection).geometry
