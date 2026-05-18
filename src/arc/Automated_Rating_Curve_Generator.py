@@ -1108,11 +1108,11 @@ def flood_increments(i_number_of_increments: int, d_inc_y: float, flood_incremen
             # also add a top‑level guard before saving the initial (non‑refined) Q
             # right after computing the first Q/V for this increment:
             if (Q <= prev_q) or (Q > d_q_sum) or Q > d_q_sum:
-                add_hydraulic_data(output_data, i_entry_elevation, prev_wse - 100 if b_modified_dem else prev_wse, prev_t, prev_p, prev_q, prev_v, i_entry_cell, b_modified_dem)
+                add_hydraulic_data(output_data, i_entry_elevation, prev_wse, prev_t, prev_p, prev_q, prev_v, i_entry_cell, b_modified_dem)
                 continue
 
             # Save the values
-            add_hydraulic_data(output_data, i_entry_elevation, d_wse - 100 if b_modified_dem else d_wse, T, P, Q, V, i_entry_cell, b_modified_dem)
+            add_hydraulic_data(output_data, i_entry_elevation, d_wse, T, P, Q, V, i_entry_cell, b_modified_dem)
 
             # Update previous values
             prev_t = T
@@ -1652,12 +1652,13 @@ def calculate_hydraulic_data_for_cell(i_entry_cell: int):
                                                                         d_inc_y, 
                                                                         flood_increments_args, thalweg, d_slope_use, 
                                                                         d_q_sum, _OUTPUT_DATA_ARRAY, i_entry_cell, hydraulic_data.b_modified_dem)
-
-        if d_q_baseflow > 0.001 and hydraulic_data.is_start_q_greater_than_baseflow(i_start_elevation_index, d_q_baseflow, i_entry_cell):
-            hydraulic_data.set_q_at_index(i_start_elevation_index + 1, d_q_baseflow - 0.001, i_entry_cell)
-            
-        # Process each of the elevations to the output file if feasbile values were produced
-        hydraulic_data.set_vdt_data(i_cell_comid, d_q_baseflow, d_slope_use, i_entry_cell, i_number_of_elevations)
+        
+        if i_last_elevation_index > i_start_elevation_index:
+            if d_q_baseflow > 0.001 and hydraulic_data.is_start_q_greater_than_baseflow(i_start_elevation_index, d_q_baseflow, i_entry_cell):
+                hydraulic_data.set_q_at_index(i_start_elevation_index + 1, d_q_baseflow - 0.001, i_entry_cell)
+                
+            # Process each of the elevations to the output file if feasbile values were produced
+            hydraulic_data.set_vdt_data(i_cell_comid, d_q_baseflow, d_slope_use, i_entry_cell, i_number_of_elevations)
 
         add_curve_file_data = i_number_of_elevations > 0
 
