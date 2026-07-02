@@ -52,6 +52,7 @@ _STREAMS: np.ndarray = None
 _BATHYMETRY: np.ndarray = None
 _MANNINGS_N: np.ndarray = None
 _LAND_COVER: np.ndarray = None
+_BATHY_WATER_MASK: np.ndarray = None
 _OUTPUT_DATA_ARRAY: np.ndarray = None
 _OUT_FLOOD: np.ndarray = None
 _PARAMS: dict | None = None
@@ -77,6 +78,7 @@ ARRAY_NAMES = [
     '_STREAMS',
     '_BATHYMETRY',
     '_MANNINGS_N',
+    '_BATHY_WATER_MASK',
     '_LAND_COVER',
     '_OUTPUT_DATA_ARRAY',
     '_OUT_FLOOD',
@@ -595,7 +597,8 @@ def read_main_input_file(s_mif_name: str, args: dict):
         'b_FindBanksBasedOnLandCover': b_FindBanksBasedOnLandCover, # Find the true/false variable to find the banks of the river based on the land cover dataset instead of the DEM
         'b_reach_average_curve_file': b_reach_average_curve_file, # Find the true/false variable to use a reach-average curve file
         's_output_flood': get_parameter_name(sl_lines,  'AROutFLOOD'), # Find the path to the output flood file
-
+        'use_bathy_water_mask': to_bool(get_parameter_name(sl_lines,  'ARC_Use_BathyWaterMask', False)), # Find the true/false variable to use the bathymetry water mask
+        'bathy_water_mask': get_parameter_name(sl_lines,  'BathyWaterMask', ''), # Find the path to the bathymetry water mask,
     }
 
     return params
@@ -1490,7 +1493,7 @@ def calculate_hydraulic_data_for_cell(i_entry_cell: int):
         #Default to using the 'local_average' method
         d_slope_use = get_local_average_stream_slope_information(i_row_cell, i_column_cell, _DEM, _STREAMS, dx, dy, i_general_slope_distance)
 
-    x_section = get_cross_section(dx, dy, _DEM, _LAND_COVER, _PARAMS)
+    x_section = get_cross_section(dx, dy, _DEM, _LAND_COVER, _PARAMS, _BATHY_WATER_MASK)
     if using_manual_cross_sections:
         apply_manual_cross_section_data(x_section, manual_record)
     else:
@@ -2107,6 +2110,12 @@ def _main(MIF_Name: str, args: dict, quiet: bool = False, processes: int | Liter
     dm_elevation, dncols, dnrows, dcellsize, dyll, dyur, dxll, dxur, dlat, dem_geotransform, dem_projection, dem_maxx, dem_miny, dem_dy = read_and_pad_and_maybe_make_shared(params['s_input_dem_path'], processes, i_boundary_number, np.float32, "_DEM")
     dm_stream, sncols, snrows, scellsize, syll, syur, sxll, sxur, slat, strm_geotransform, strm_projection, maxx, miny, dy = read_and_pad_and_maybe_make_shared(params['s_input_stream_path'], processes, i_boundary_number, np.int64, "_STREAMS")
     dm_land_use, lncols, lnrows, lcellsize, lyll, lyur, lxll, lxur, llat, land_geotransform, land_projection, maxx, miny, dy = read_and_pad_and_maybe_make_shared(params['s_input_land_use_path'], processes, i_boundary_number, np.uint8, "_LAND_COVER")
+
+    if params["use_bathy_water_mask"]:
+        if not params["bathy_water_mask"]:
+            LOG.error("BathyWaterMask is required when ARC_Use_BathyWaterMask is True.")
+            return
+        read_and_pad_and_maybe_make_shared(params['bathy_water_mask'], processes, i_boundary_number, np.uint8, "_BATHY_WATER_MASK")
 
     ### Determine if the rasters are in a projected coordinate system (units in meters) or geographic coordinate system (units in degrees)
     if 'PROJCS' in dem_projection:
