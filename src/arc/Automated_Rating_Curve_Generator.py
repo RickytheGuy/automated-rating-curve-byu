@@ -56,10 +56,10 @@ _BATHY_WATER_MASK: np.ndarray = None
 _OUTPUT_DATA_ARRAY: np.ndarray = None
 _OUT_FLOOD: np.ndarray = None
 _PARAMS: dict | None = None
+_INDEX_ARRAYS: np.ndarray = None
 _SHARED_MEMORYS: dict[str, shared_memory.SharedMemory] = {}
 _CROSS_SECTION: CrossSection = None
 _HYDRAULIC_DATA: HydraulicData = None
-_INDEX_ARRAYS: np.ndarray = None
 _Z_DISTANCE_ARRAY: np.ndarray = None
 _INDEX_FRACT_ARRAYS: np.ndarray = None
 _CELL_ROWS: np.ndarray = None
@@ -126,7 +126,7 @@ def _set_shared(name: str, shm: shared_memory.SharedMemory):
     _SHARED_MEMORYS[name] = shm
 
 def reset_globals():
-    for name in ARRAY_NAMES + ['_CROSS_SECTION', '_HYDRAULIC_DATA', '_MANUAL_CROSS_SECTION_RECORDS']:
+    for name in ARRAY_NAMES + ['_CROSS_SECTION', '_HYDRAULIC_DATA', '_MANUAL_CROSS_SECTION_RECORDS', '_PARAMS']:
         globals()[name] = None
 
 def sample_line_for_valid_z(line: LineString, dm_elevation: np.ndarray, xy_to_rowcol, length_m, step_fraction=0.02):
@@ -283,7 +283,9 @@ def line_slope_from_dem(line_geom: LineString, dm_elevation: np.ndarray, dem_geo
 
 @njit(cache=True)
 def safe_signs_differ(fa, fb, tol=1e-10):
-
+    if np.isnan(fa) or np.isnan(fb):
+        return False
+    
     safe_signs = False
 
     # Rounds small floating point noise and checks for real sign difference
@@ -586,7 +588,7 @@ def read_main_input_file(s_mif_name: str, args: dict):
         'd_degree_interval': float(get_parameter_name(sl_lines,  'Degree_Interval', 1.0)), # Find the degree interval parameter
         'i_low_spot_range': int(get_parameter_name(sl_lines,  'Low_Spot_Range', 0)), # Find the low spot range parameter
         'i_general_direction_distance': int(get_parameter_name(sl_lines,  'Gen_Dir_Dist', 10)), # Find the general direction distance parameter
-        'i_general_slope_distance': int(get_parameter_name(sl_lines,  'Gen_Slope_Dist', 0)), # Find the general slope distance parameter
+        'i_general_slope_distance': int(get_parameter_name(sl_lines,  'Gen_Slope_Dist', 10)), # Find the general slope distance parameter
         'd_bathymetry_trapzoid_height': float(get_parameter_name(sl_lines,  'Bathy_Trap_H', 0.2)), # Find the bathymetry trapezoid height parameter,
         'b_bathy_use_banks': b_bathy_use_banks, # Find the true/false variable to use the bank elevations to calculate the depth of the bathymetry estimate
         's_output_bathymetry_path': s_output_bathymetry_path, # Find the path to the output bathymetry file
@@ -1208,6 +1210,19 @@ def find_wse(range_end, start_wse, increment, d_q_maximum, x_sect_args, d_slope_
     d_q_sum = 0.0
     sqrt_slope = d_slope_use**0.5
 
+    # First verify that the search bracket is valid
+    q_min = calculate_discharge_from_wse(start_wse, sqrt_slope, *x_sect_args)
+    q_max = calculate_discharge_from_wse(
+        start_wse + range_end * increment,
+        sqrt_slope,
+        *x_sect_args,
+    )
+    if d_q_maximum < q_min:
+        return start_wse, q_min, False
+
+    if d_q_maximum > q_max:
+        return start_wse + range_end * increment, q_max, False
+
     low = 0
     high = range_end
     
@@ -1249,7 +1264,7 @@ def find_wse(range_end, start_wse, increment, d_q_maximum, x_sect_args, d_slope_
         prev_q = d_q_sum
         can_interpolate = True
 
-    return d_wse, d_q_sum
+    return d_wse, d_q_sum, True
 
 @njit(cache=True)
 def flood_increments(i_number_of_increments: int, d_inc_y: float, flood_increments_args: tuple, thalweg: float, d_slope_use: float, d_q_sum: float, output_data: np.ndarray, i_entry_cell: int, b_modified_dem: bool):
@@ -1405,7 +1420,7 @@ def objective_with_slope(trial_slope: float,
                          d_maxflow_wse_initial: float, d_depth_increment_small: float, d_q_maximum: float,
                          x_sect_args) -> float:
     # find_wse returns a tuple: (d_maxflow_wse_final, d_q_sum)
-    _, trial_d_q_sum = find_wse(
+    _, trial_d_q_sum, success = find_wse(
         2501, 
         d_maxflow_wse_initial, 
         d_depth_increment_small, 
@@ -1413,6 +1428,9 @@ def objective_with_slope(trial_slope: float,
         x_sect_args,
         trial_slope
     )
+    if not success:
+        return np.nan
+
     # The objective is zero when trial_d_q_sum equals d_q_maximum.
     return trial_d_q_sum - d_q_maximum
 
@@ -1586,8 +1604,11 @@ def calculate_hydraulic_data_for_cell(i_entry_cell: int):
     if safe_signs_differ(f_lower, f_upper):
         # The signs differ, so we have a valid bracket.
         # For 3 decimal places, xtol only needs to be 0.001
-        d_maxflow_wse_final = np.round(brentq(objective_with_wse, wse_lower, wse_upper, xtol=0.001, args=wse_obj_args), 3)
-        d_q_sum = calculate_discharge_from_wse(d_maxflow_wse_final, slope_use_squared, *x_sect_args)
+        try:
+            d_maxflow_wse_final = np.round(brentq(objective_with_wse, wse_lower, wse_upper, xtol=0.001, args=wse_obj_args), 3)
+            d_q_sum = calculate_discharge_from_wse(d_maxflow_wse_final, slope_use_squared, *x_sect_args)
+        except:
+            pass
     elif np.round(f_lower, 5) == 0 or np.round(f_upper, 5) == 0:          
         # if the f_lower or f_upper is equal to zero, it's probably close enough to be the WSE we are looking for, so we'll use it
         d_maxflow_wse_final = np.round(wse_lower, 3) if np.round(f_lower, 5) == 0 else np.round(wse_upper, 3)
@@ -1595,18 +1616,18 @@ def calculate_hydraulic_data_for_cell(i_entry_cell: int):
 
     # Let's see if the volume-fill approach gave us a better answer and use that if it did
     # To find the depth / wse where the maximum flow occurs we use two sets of incremental depths.  The first is 0.5m followed by 0.05m
-    d_maxflow_wse_initial, d_q_sum_test = find_wse(101, d_maxflow_wse_initial, DEPTH_INCREMENT_BIG, d_q_maximum, x_sect_args, d_slope_use)
+    d_maxflow_wse_initial, d_q_sum_test, success = find_wse(101, d_maxflow_wse_initial, DEPTH_INCREMENT_BIG, d_q_maximum, x_sect_args, d_slope_use)
 
 
     # Based on using depth increments of 0.5, now lets fine-tune the wse using depth increments of 0.05
     d_maxflow_wse_initial = max(d_maxflow_wse_initial - 0.5, thalweg)
     d_maxflow_wse_med = d_maxflow_wse_initial
-    d_maxflow_wse_med, d_q_sum_test = find_wse(101, d_maxflow_wse_med, DEPTH_INCREMENT_MEDIUM, d_q_maximum, x_sect_args, d_slope_use)
+    d_maxflow_wse_med, d_q_sum_test, success = find_wse(101, d_maxflow_wse_med, DEPTH_INCREMENT_MEDIUM, d_q_maximum, x_sect_args, d_slope_use)
 
     # Based on using depth increments of 0.05, now lets fine-tune the wse even more using depth increments of 0.01
     d_maxflow_wse_med = max(d_maxflow_wse_med - 0.05, thalweg)
     d_maxflow_wse_final_test = d_maxflow_wse_med
-    d_maxflow_wse_final_test, d_q_sum_test = find_wse(2501, d_maxflow_wse_med, DEPTH_INCREMENT_SMALL, d_q_maximum, x_sect_args, d_slope_use)
+    d_maxflow_wse_final_test, d_q_sum_test, success = find_wse(2501, d_maxflow_wse_med, DEPTH_INCREMENT_SMALL, d_q_maximum, x_sect_args, d_slope_use)
 
     # let's see if the iterative method gave use a better result and use that if it did
     if abs(d_q_sum_test - d_q_maximum) < abs(d_q_sum-d_q_maximum):
@@ -1641,10 +1662,13 @@ def calculate_hydraulic_data_for_cell(i_entry_cell: int):
 
         if safe_signs_differ(f_lower, f_upper):
             # The signs differ, so we have a valid bracket.
-            trial_slope_use = brentq(objective_with_slope, slope_lower, slope_upper, xtol=0.0001, args=slope_obj_args)
+            try:
+                trial_slope_use = brentq(objective_with_slope, slope_lower, slope_upper, xtol=0.0001, args=slope_obj_args)
+            except:
+                trial_slope_use = 0
             trial_slope_use = np.round(trial_slope_use, MIN_SLOPE_DECIMAL_PLACES)
             # Optionally, recompute d_maxflow_wse_final and d_q_sum with the new slope:
-            d_maxflow_wse_final_test, d_q_sum_test = find_wse(
+            d_maxflow_wse_final_test, d_q_sum_test, success = find_wse(
                 2501, 
                 d_maxflow_wse_initial, 
                 DEPTH_INCREMENT_SMALL, 
@@ -1664,7 +1688,7 @@ def calculate_hydraulic_data_for_cell(i_entry_cell: int):
         elif np.round(f_lower, 5) == 0:          
             trial_slope_use = np.round(slope_lower, MIN_SLOPE_DECIMAL_PLACES)
             # Optionally, recompute d_maxflow_wse_final and d_q_sum with the new slope:
-            d_maxflow_wse_final_test, d_q_sum_test = find_wse(
+            d_maxflow_wse_final_test, d_q_sum_test, success = find_wse(
                 2501, 
                 d_maxflow_wse_initial, 
                 DEPTH_INCREMENT_SMALL, 
@@ -1683,7 +1707,7 @@ def calculate_hydraulic_data_for_cell(i_entry_cell: int):
         elif np.round(f_upper, 5) == 0:          
             trial_slope_use = np.round(slope_upper, MIN_SLOPE_DECIMAL_PLACES)
             # Optionally, recompute d_maxflow_wse_final and d_q_sum with the new slope:
-            d_maxflow_wse_final_test, d_q_sum_test = find_wse(
+            d_maxflow_wse_final_test, d_q_sum_test, success = find_wse(
                 2501, 
                 d_maxflow_wse_initial, 
                 DEPTH_INCREMENT_SMALL, 
@@ -1724,13 +1748,15 @@ def calculate_hydraulic_data_for_cell(i_entry_cell: int):
         
         
         if safe_signs_differ(f_lower, f_upper):
-            
             # The signs differ, so we have a valid bracket.
-            trial_slope_use = brentq(objective_with_slope, slope_lower, slope_upper, xtol=0.0001, args=slope_obj_args)
+            try:
+                trial_slope_use = brentq(objective_with_slope, slope_lower, slope_upper, xtol=0.0001, args=slope_obj_args)
+            except:
+                trial_slope_use = 0
             trial_slope_use = np.round(trial_slope_use, MIN_SLOPE_DECIMAL_PLACES)
         
             # Optionally, recompute d_maxflow_wse_final and d_q_sum with the new slope:
-            d_maxflow_wse_final_test, d_q_sum_test = find_wse(
+            d_maxflow_wse_final_test, d_q_sum_test, success = find_wse(
                 2501, 
                 d_maxflow_wse_initial, 
                 DEPTH_INCREMENT_SMALL, 
@@ -1750,7 +1776,7 @@ def calculate_hydraulic_data_for_cell(i_entry_cell: int):
         elif np.round(f_lower, 5) == 0:          
             trial_slope_use = np.round(slope_lower, MIN_SLOPE_DECIMAL_PLACES)
             # Optionally, recompute d_maxflow_wse_final and d_q_sum with the new slope:
-            d_maxflow_wse_final_test, d_q_sum_test = find_wse(
+            d_maxflow_wse_final_test, d_q_sum_test, success = find_wse(
                 2501, 
                 d_maxflow_wse_initial, 
                 DEPTH_INCREMENT_SMALL, 
@@ -1769,7 +1795,7 @@ def calculate_hydraulic_data_for_cell(i_entry_cell: int):
         elif np.round(f_upper, 5) == 0:          
             trial_slope_use = np.round(slope_upper, MIN_SLOPE_DECIMAL_PLACES)
             # Optionally, recompute d_maxflow_wse_final and d_q_sum with the new slope:
-            d_maxflow_wse_final_test, d_q_sum_test = find_wse(
+            d_maxflow_wse_final_test, d_q_sum_test, success = find_wse(
                 2501, 
                 d_maxflow_wse_initial, 
                 DEPTH_INCREMENT_SMALL, 
@@ -1791,16 +1817,13 @@ def calculate_hydraulic_data_for_cell(i_entry_cell: int):
     if not acceptable:
         hydraulic_data.add_empty_x_section_for_curve_file(i_cell_comid, d_slope_use, i_entry_cell)
         return
-    
-    # This just tells the curve file whether to print out a result or not.  If no realistic depths were calculated, no reason to output results.
-    add_curve_file_data = False
 
     # This is the first and last indice of elevations we'll need for the Curve Fitting for this cell
     i_start_elevation_index = -1
     i_last_elevation_index = 0
 
     # if we have a usable value for d_maxflow_wse_final, lets get rest of the VDT data
-    if acceptable and d_maxflow_wse_final > 0.0:
+    if acceptable and d_maxflow_wse_final > 0.0 and i_number_of_increments > 0:
         # round d_q_sum to the 3rd decimal place
         d_q_sum = round(d_q_sum, 3)
         # Now lets get a set number of increments between the low elevation and the elevation where Qmax hits
@@ -2287,14 +2310,14 @@ def _main(MIF_Name: str, args: dict, quiet: bool = False, processes: int | Liter
     hydraulic_data = run_main_loop(len(ia_valued_row_indices), params, quiet, processes)
 
     # Create the output VDT Database file - datatypes are figured out automatically
-    if not hydraulic_data.has_vdt_data():
+    if not hydraulic_data.has_vdt_data() and _PARAMS['i_number_of_increments'] > 0:
         LOG.warning('No VDT data was generated, so no hydraulic output files will be created.')
         return
-    
+    else:
+        hydraulic_data.save_files(id_flow_dict, params['s_flow_file_qmax'])
+
     # At this point, release all memory except for bathymetry, output array, and elevation
     close_shared_arrays([name for name in ARRAY_NAMES if name not in {"_BATHYMETRY", "_OUTPUT_DATA_ARRAY", "_DEM"}])
-    
-    hydraulic_data.save_files(id_flow_dict, params['s_flow_file_qmax'])
 
     # Write the output rasters
     if len(s_output_bathymetry_path) > 1:

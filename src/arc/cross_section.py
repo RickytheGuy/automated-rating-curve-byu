@@ -1163,7 +1163,7 @@ def _calculate_stream_geometry(da_xs_profile: np.ndarray,
     # Take action if there are values < 0
     lt_0_in_depths, i_target_index = _check_for_negative_depths(da_y_depth)
     
-    if lt_0_in_depths:
+    if lt_0_in_depths or len(da_y_depth) < 2:
         # A value < 0 exists. Calculate up to that value then break for the rest of hte values.
         # Get the index of the first bad vadlue
         i_target_index += 1
@@ -1309,7 +1309,7 @@ def calculate_discharge_from_wse(wse: float, sqrt_slope: float, profile1: np.nda
     d_a_sum = A1 + A2
     d_p_sum = max(P1 + P2, 1e-6)  # Avoid division by zero
 
-    d_composite_n = np.round(((np1 + np2) / d_p_sum)**(2 / 3), 4)
+    d_composite_n = ((np1 + np2) / d_p_sum)**(2 / 3)
 
     # Check that the mannings n is physically realistic
     if d_composite_n < 0.0001:
