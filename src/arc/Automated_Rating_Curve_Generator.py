@@ -434,7 +434,7 @@ def read_and_pad_and_maybe_make_shared(s_input_filename: str, processes: int, pa
     o_dataset = None
 
     # Write metdata information to the console
-    LOG.info('Spatial Data for Raster File:')
+    LOG.info(f'Spatial Data for {s_input_filename}:')
     LOG.info('   ncols = ' + str(i_number_of_columns))
     LOG.info('   nrows = ' + str(i_number_of_rows))
     LOG.info('   cellsize = ' + str(d_cell_size))
