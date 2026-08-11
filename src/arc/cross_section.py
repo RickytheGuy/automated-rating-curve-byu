@@ -718,8 +718,8 @@ class CrossSection:
         i_landcover_for_bathy = self.ia_lc_xs1[0]
         
         # Initially set the bank info to zeros and bank elevations to the current water surface elevation
-        i_bank_1_index = 0
-        i_bank_2_index = 0
+        i_bank_1_index = -1
+        i_bank_2_index = -1
         bank_elev_1 = self.da_xs_profile1[0]
         bank_elev_2 = self.da_xs_profile2[0]
         d_y_depth = 0.0
@@ -742,7 +742,7 @@ class CrossSection:
                         bank_elev_2 = self.da_xs_profile2[i]
                         i_bank_2_index = i - 1
                         break
-            i_total_bank_cells = i_bank_1_index + i_bank_2_index  - 1
+            i_total_bank_cells = i_bank_1_index + i_bank_2_index + 2
             if i_total_bank_cells > 0:
                 function_used = "find_wse_and_banks_by_bathymask"
         elif self.b_FindBanksBasedOnLandCover:
@@ -761,7 +761,7 @@ class CrossSection:
                         bank_elev_2 = self.da_xs_profile2[i]
                         i_bank_2_index = i - 1
                         break
-            i_total_bank_cells = i_bank_1_index + i_bank_2_index  - 1
+            i_total_bank_cells = i_bank_1_index + i_bank_2_index + 2
             if i_total_bank_cells > 0:
                 function_used = "find_wse_and_banks_by_lc"
         else:
@@ -771,7 +771,7 @@ class CrossSection:
             # set the bank elevations
             bank_elev_1 = self.da_xs_profile1[i_bank_1_index]
             bank_elev_2 = self.da_xs_profile2[i_bank_2_index]
-            i_total_bank_cells = i_bank_1_index + i_bank_2_index - 1
+            i_total_bank_cells = i_bank_1_index + i_bank_2_index + 2
             if i_total_bank_cells > 0:
                 function_used = "find_wse_and_banks_by_flat_water"
 
@@ -780,7 +780,7 @@ class CrossSection:
             (i_bank_1_index, i_bank_2_index) = _find_bank_using_width_to_depth_ratio(self.get_thalweg(), self.da_xs_profile1, self.da_xs_profile2, self.xs1_n, self.xs2_n, self.d_ordinate_dist)
             bank_elev_1 = self.da_xs_profile1[i_bank_1_index]
             bank_elev_2 = self.da_xs_profile2[i_bank_2_index]
-            i_total_bank_cells = i_bank_1_index + i_bank_2_index - 1
+            i_total_bank_cells = i_bank_1_index + i_bank_2_index + 2
             if i_total_bank_cells > 0:
                 function_used = "find_bank_using_width_to_depth_ratio"
 
@@ -790,7 +790,7 @@ class CrossSection:
             bank_elev_1 = self.da_xs_profile1[i_bank_1_index]
             i_bank_2_index = self._find_bank_inflection_point(self.da_xs_profile2, self.xs2_n)
             bank_elev_2 = self.da_xs_profile2[i_bank_2_index]
-            i_total_bank_cells = i_bank_1_index + i_bank_2_index
+            i_total_bank_cells = i_bank_1_index + i_bank_2_index + 2
             if i_total_bank_cells > 0:
                 function_used = "find_bank_inflection_point"
 
@@ -813,7 +813,7 @@ class CrossSection:
             if d_y_depth >= 25 or d_y_bathy > d_bankfull_elevation and (function_used in {"find_wse_and_banks_by_lc",  "find_wse_and_banks_by_flat_water", "find_wse_and_banks_by_bathymask"}):
                 # Recalculate using width-to-depth ratio
                 (i_bank_1_index, i_bank_2_index) =  _find_bank_using_width_to_depth_ratio(base_elev, self.da_xs_profile1, self.da_xs_profile2, self.xs1_n, self.xs2_n, self.d_ordinate_dist)
-                i_total_bank_cells = i_bank_1_index + i_bank_2_index -1
+                i_total_bank_cells = i_bank_1_index + i_bank_2_index + 2
                 if i_total_bank_cells > 0:
                     function_used = "find_bank_using_width_to_depth_ratio"
                 
@@ -835,7 +835,7 @@ class CrossSection:
                     bank_elev_1 = self.da_xs_profile1[i_bank_1_index]
                     i_bank_2_index = self._find_bank_inflection_point(self.da_xs_profile2, self.xs2_n)
                     bank_elev_2 = self.da_xs_profile2[i_bank_2_index]
-                    i_total_bank_cells = i_bank_1_index + i_bank_2_index - 1
+                    i_total_bank_cells = i_bank_1_index + i_bank_2_index + 2
                     if i_total_bank_cells > 0:
                         function_used = "find_bank_inflection_point"
                     d_bankfull_elevation = calc_bankfull_elevation(base_elev, bank_elev_1, bank_elev_2)
@@ -850,8 +850,8 @@ class CrossSection:
                     if d_y_depth >= 25 or d_y_bathy > d_bankfull_elevation or i_total_bank_cells <= 0:
                         d_y_depth = 0
                         d_y_bathy = self.da_xs_profile1[0]
-                        i_bank_1_index = 0
-                        i_bank_2_index = 0
+                        i_bank_1_index = -1
+                        i_bank_2_index = -1
                         i_total_bank_cells = 0
 
             elif d_y_depth >= 25 or d_y_bathy > d_bankfull_elevation and function_used == "find_bank_using_width_to_depth_ratio":
@@ -860,7 +860,7 @@ class CrossSection:
                 bank_elev_1 = self.da_xs_profile1[i_bank_1_index]
                 i_bank_2_index = self._find_bank_inflection_point(self.da_xs_profile2, self.xs2_n)
                 bank_elev_2 = self.da_xs_profile2[i_bank_2_index]
-                i_total_bank_cells = i_bank_1_index + i_bank_2_index -1
+                i_total_bank_cells = i_bank_1_index + i_bank_2_index + 2
                 if i_total_bank_cells > 0:
                     function_used = "find_bank_inflection_point"
                 d_bankfull_elevation = calc_bankfull_elevation(base_elev, bank_elev_1, bank_elev_2)
@@ -875,15 +875,15 @@ class CrossSection:
                 if d_y_depth >= 25 or d_y_bathy > d_bankfull_elevation or i_total_bank_cells <= 0:
                     d_y_depth = 0
                     d_y_bathy = self.da_xs_profile1[0]
-                    i_bank_1_index = 0
-                    i_bank_2_index = 0
+                    i_bank_1_index = -1
+                    i_bank_2_index = -1
                     i_total_bank_cells = 0
 
             elif d_y_depth >= 25 or d_y_bathy > d_bankfull_elevation and function_used == "find_bank_inflection_point":
                 d_y_depth = 0
                 d_y_bathy = self.da_xs_profile1[0]
-                i_bank_1_index = 0
-                i_bank_2_index = 0
+                i_bank_1_index = -1
+                i_bank_2_index = -1
                 i_total_bank_cells = 0
                 function_used = None
 
@@ -891,8 +891,8 @@ class CrossSection:
             # No valid baseflow or method; set defaults.
             d_y_depth = 0.0
             d_y_bathy = self.da_xs_profile1[0]
-            i_bank_1_index = 0
-            i_bank_2_index = 0
+            i_bank_1_index = -1
+            i_bank_2_index = -1
             i_total_bank_cells = 0
         
         # if function_used == "find_wse_and_banks_by_flat_water":
@@ -1776,7 +1776,7 @@ def calc_bankfull_elevation(base_elev, bank_elev_1, bank_elev_2):
 @njit(cache=True)
 def _find_bank_inflection_point_helper(da_xs_smooth: np.ndarray, i_cross_section_number: int, d_ordinate_dist: float) -> int:
     # Loop on the smoothed cross-section cells
-    entry = 0
+    entry = -1
     previous_delta_elevation = 0.0
     total_width = 0.0
     while entry < min(i_cross_section_number, len(da_xs_smooth) - 1):
@@ -1794,7 +1794,7 @@ def _find_bank_inflection_point_helper(da_xs_smooth: np.ndarray, i_cross_section
             return entry  # or return entry - 1 if you want the previous one
 
     # Return to the calling function
-    return 0
+    return -1
 
 @njit(cache=True)
 def _find_bank_using_width_to_depth_ratio(d_bottom_elevation: float, da_xs_profile1: np.ndarray, da_xs_profile2: np.ndarray, xs1_n: int, xs2_n: int, d_ordinate_dist: float) -> tuple[int, int]:
@@ -1851,7 +1851,7 @@ def _find_bank_using_width_to_depth_ratio(d_bottom_elevation: float, da_xs_profi
         i_bank_2_index = int(T2 / d_ordinate_dist)
     # if we have made it to 25 on d_depth, something is wrong and the banks will be set at the stream cell
     elif d_depth >= 25:
-        i_bank_1_index = 0
-        i_bank_2_index = 0
+        i_bank_1_index = -1
+        i_bank_2_index = -1
 
     return (i_bank_1_index, i_bank_2_index)

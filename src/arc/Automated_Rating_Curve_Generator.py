@@ -1552,8 +1552,7 @@ def calculate_hydraulic_data_for_cell(i_entry_cell: int):
         manual_record = _MANUAL_CROSS_SECTION_RECORDS.get(int(i_cell_comid))
         if manual_record is None:
             raise KeyError(f"Manual cross section for ID {i_cell_comid} was not found.")
-    if i_cell_comid == 760554805:
-        pass
+
     # Get the Slope of each Stream Cell. Slope should be in m/m
     s_stream_slope_method = _PARAMS['s_stream_slope_method']
     dx = _PARAMS['dx']
