@@ -25,21 +25,22 @@ import sys
 import os
 import math
 import warnings
-from typing import Literal
 from pathlib import Path
+from typing import Literal
+from datetime import datetime
+from multiprocessing import Pool, shared_memory
 
 import tqdm
 import yaml
 import numpy as np
 import pandas as pd
-from datetime import datetime
+import networkx as nx
 import geopandas as gpd
-from scipy.optimize import OptimizeWarning, brentq
-from shapely.geometry import LineString, MultiLineString
 from osgeo import gdal
 from pyproj import CRS, Geod
 from numba import njit, vectorize
-from multiprocessing import Pool, shared_memory
+from scipy.optimize import OptimizeWarning, brentq
+from shapely.geometry import LineString, MultiLineString
 
 from arc import LOG
 from arc.cross_section import CrossSection, calculate_discharge_from_wse, _calculate_all
@@ -73,6 +74,8 @@ _CELL_REACH_SLOPE: np.ndarray = None
 _CELL_SLOPE_25: np.ndarray = None
 _CELL_SLOPE_75: np.ndarray = None
 _MANUAL_CROSS_SECTION_RECORDS: dict[int, dict] | None = None
+_LAST_BANKFULL_WSE: dict[int, float] = {} # Maps a COMID to the last bankfull WSE
+_UPSTREAM_COMID_MAP: dict[int, list[int]] = {} # Maps a COMID to a list of upstream COMIDs
 
 ARRAY_NAMES = [
     '_DEM',
@@ -1435,6 +1438,19 @@ def objective_with_slope(trial_slope: float,
     # The objective is zero when trial_d_q_sum equals d_q_maximum.
     return trial_d_q_sum - d_q_maximum
 
+def load_graph(strm_path):
+    strm_path = Path(strm_path)
+    if strm_path.suffix in {'.pq', '.parquet'}:
+        gdf = pd.read_parquet(strm_path, columns=['LINKNO', 'DSLINKNO'])
+    else:
+        gdf = gpd.read_file(strm_path, columns=['LINKNO', 'DSLINKNO'], ignore_geometry=True)
+
+    G: nx.DiGraph = nx.from_pandas_edgelist(gdf, source='LINKNO', target='DSLINKNO', create_using=nx.DiGraph())
+    if -1 in G:
+        G.remove_node(-1)  # Remove the "no downstream" node
+
+    return G
+
 def initialize_stream_slope_dictionaries(params: dict, dx, dy, dem_geotransform, dem_projection, quiet, processes, i_boundary_number):
     s_stream_slope_method = params['s_stream_slope_method']
     if s_stream_slope_method == 'reach_average' or s_stream_slope_method == 'local_average_corrected':
@@ -1447,15 +1463,7 @@ def initialize_stream_slope_dictionaries(params: dict, dx, dy, dem_geotransform,
             if not params['s_strmshp_path']:
                 LOG.error(f"Bad streams found: {bad_streams}. Please provide a stream vector file to calclulate slopes.")
 
-            strm_path = Path(params['s_strmshp_path'])
-            if strm_path.suffix in {'.pq', '.parquet'}:
-                gdf = pd.read_parquet(strm_path, columns=['LINKNO', 'DSLINKNO'])
-            else:
-                gdf = gpd.read_file(strm_path, columns=['LINKNO', 'DSLINKNO'], ignore_geometry=True)
-
-            import networkx as nx
-            G: nx.DiGraph = nx.from_pandas_edgelist(gdf, source='LINKNO', target='DSLINKNO', create_using=nx.DiGraph())
-            G.remove_node(-1)  # Remove the "no downstream" node
+            G = load_graph(params['s_strmshp_path'])
             updated = True
             while updated:
                 updated = False
@@ -1628,7 +1636,7 @@ def calculate_hydraulic_data_for_cell(i_entry_cell: int):
         x_section.Calculate_Bathymetry_Based_on_WSE_or_LC(d_q_baseflow, d_slope_use, _BATHYMETRY)
     #This method calculates the banks based on the Riverbank
     elif b_bathy_use_banks and s_output_bathymetry_path != '':
-        x_section.Calculate_Bathymetry_Based_on_RiverBank_Elevations(d_q_baseflow, d_slope_use, _BATHYMETRY)
+        x_section.Calculate_Bathymetry_Based_on_RiverBank_Elevations(d_q_baseflow, d_slope_use, _BATHYMETRY, _LAST_BANKFULL_WSE, i_cell_comid, _UPSTREAM_COMID_MAP.get(i_cell_comid, []))
 
     # Calculate the volumes
     # VolumeFillApproach 1 is to find the height within ElevList_mm that corresponds to the Qmax flow.  THen increment depths to have a standard number of depths to get to Qmax.  
@@ -2155,6 +2163,99 @@ def create_array(name: str, processes: int, shape: tuple, dtype: np.dtype, fill_
     globals()[name] = arr
     return arr
 
+# @njit(cache=True, nogil=True)
+def get_rows_and_cols_for_stream_in_descending_order(
+    comid: int,
+    upstream_ids: list[int],
+    downstream_id: int,
+    streams: np.ndarray,
+    dem: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    If we have upstream ids, find the row and col which has the comid, and has a neighbor which is in the upstream ids.
+    If there are multiple, choose the one with the highest elevation.
+    If we have downstream ids, do a similar process.
+    If we have neither, find the highest elevation cell with the comid, with the fewest neighbors with the same comid.
+
+    Then, just collect the rows and cols, and iterate through the stream down or upstream, until we reach the end of the stream.  Return the rows and cols in order from upstream to downstream.
+    """
+    rows, cols = np.where(streams == comid)
+    if len(rows) == 0:
+        return [], []
+
+    upstream_set = set(upstream_ids)
+    upstream_row = -1
+    upstream_col = -1
+    downstream_row = -1
+    downstream_col = -1
+    highest_row = -1
+    highest_col = -1
+    for r, c in zip(rows, cols):
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < streams.shape[0] and 0 <= nc < streams.shape[1]:
+                if upstream_ids:
+                    if streams[nr, nc] in upstream_set:
+                        if upstream_row == -1:
+                            upstream_row = r
+                            upstream_col = c
+                        elif dem[r, c] > dem[upstream_row, upstream_col]:
+                            upstream_row = r
+                            upstream_col = c
+                elif downstream_id > 0:
+                    if streams[nr, nc] == downstream_id:
+                        if downstream_row == -1:
+                            downstream_row = r
+                            downstream_col = c
+                        elif dem[r, c] < dem[downstream_row, downstream_col]:
+                            downstream_row = r
+                            downstream_col = c
+                else:
+                    if highest_row == -1:
+                        highest_row = r
+                        highest_col = c
+                    elif dem[r, c] > dem[highest_row, highest_col]:
+                        highest_row = r
+                        highest_col = c
+
+    if upstream_row != -1:
+        start_row, start_col = upstream_row, upstream_col
+    elif downstream_row != -1:
+        start_row, start_col = downstream_row, downstream_col
+    else:
+        start_row, start_col = highest_row, highest_col
+
+    # Now we have the starting point, we can traverse the stream to get the full path
+    path_rows = [start_row]
+    path_cols = [start_col]
+    visited = set()
+    visited.add((start_row, start_col))
+
+    while True:
+        current_row, current_col = path_rows[-1], path_cols[-1]
+        neighbors = []
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]:
+            nr, nc = current_row + dr, current_col + dc
+            if 0 <= nr < streams.shape[0] and 0 <= nc < streams.shape[1]:
+                if streams[nr, nc] == comid and (nr, nc) not in visited:
+                    neighbors.append((nr, nc))
+        if neighbors:
+            if len(neighbors) > 1:
+                # Choose the closest neighbor (cartesian distance) to the last point in the path
+                last_row, last_col = path_rows[-1], path_cols[-1]
+                closest_neighbor = min(neighbors, key=lambda x: (x[0] - last_row) ** 2 + (x[1] - last_col) ** 2)
+                path_rows.append(closest_neighbor[0])
+                path_cols.append(closest_neighbor[1])
+                visited.add((closest_neighbor[0], closest_neighbor[1]))
+            else:
+                path_rows.append(neighbors[0][0])
+                path_cols.append(neighbors[0][1])
+                visited.add((neighbors[0][0], neighbors[0][1]))
+        else:
+            break
+
+    return path_rows, path_cols
+
 def _main(MIF_Name: str, args: dict, quiet: bool = False, processes: int | Literal["auto"] = 1):
     """
     Internal driver for ARC.
@@ -2287,6 +2388,8 @@ def _main(MIF_Name: str, args: dict, quiet: bool = False, processes: int | Liter
             )
             params['d_x_section_distance'] = required_x_section_distance
 
+    b_bathy_use_banks = params['b_bathy_use_banks']
+
     # Get the list of stream locations. In manual mode, the location list comes
     # from the manual cross-section file rather than from the stream raster.
     flow_ids = np.fromiter(id_flow_dict.keys(), count=len(id_flow_dict), dtype=np.int64)
@@ -2315,8 +2418,37 @@ def _main(MIF_Name: str, args: dict, quiet: bool = False, processes: int | Liter
             for flow_id in matching_flow_ids
         }
     else:
-        ia_valued_row_indices, ia_valued_column_indices = np.where(np.isin(dm_stream, flow_ids, kind='table'))
-        create_array("_CELL_COMIDS", processes, (ia_valued_row_indices.size,), np.int64)[:] = dm_stream[ia_valued_row_indices, ia_valued_column_indices]
+        if b_bathy_use_banks:
+            # Let us load in the COMIDs topographically. 
+            G = load_graph(params["s_strmshp_path"])
+            comids = []
+            all_rows = []
+            all_cols = []
+            for comid in nx.topological_sort(G):
+                if comid not in id_flow_dict:
+                    continue
+
+                upstreams = list(G.predecessors(comid))
+                _UPSTREAM_COMID_MAP[comid] = upstreams
+                downstream = next(iter(G.successors(comid)), -1)
+
+                rows, cols = get_rows_and_cols_for_stream_in_descending_order(
+                    comid,
+                    upstreams,
+                    downstream,
+                    dm_stream,
+                    dm_elevation
+                )
+                comids.extend([comid] * len(rows))
+                all_rows.extend(rows)
+                all_cols.extend(cols)
+
+            ia_valued_row_indices = np.asarray(all_rows, dtype=np.int64)
+            ia_valued_column_indices = np.asarray(all_cols, dtype=np.int64)
+            create_array("_CELL_COMIDS", processes, (ia_valued_row_indices.size,), np.int64)[:] = np.asarray(comids, dtype=np.int64)
+        else:
+            ia_valued_row_indices, ia_valued_column_indices = np.where(np.isin(dm_stream, flow_ids, kind='table'))
+            create_array("_CELL_COMIDS", processes, (ia_valued_row_indices.size,), np.int64)[:] = dm_stream[ia_valued_row_indices, ia_valued_column_indices]
 
     for arr, name in zip([ia_valued_row_indices, ia_valued_column_indices], ["_CELL_ROWS", "_CELL_COLS"]):
         create_array(name, processes, arr.shape, arr.dtype)[:] = arr[:]
@@ -2367,7 +2499,6 @@ def _main(MIF_Name: str, args: dict, quiet: bool = False, processes: int | Liter
         global_arr[:] = arr[:]
 
     # Extract some parameters
-    b_bathy_use_banks = params['b_bathy_use_banks']
     s_output_bathymetry_path = params['s_output_bathymetry_path']
 
     ### Begin the stream cell solution loop ###

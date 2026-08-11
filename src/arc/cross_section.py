@@ -688,7 +688,14 @@ class CrossSection:
         d_y_depth = find_depth_of_bathymetry(d_q_baseflow, d_trap_base, d_total_bank_dist, d_slope_use, 0.03)
         return d_side1_dist, d_side2_dist, d_total_bank_dist, d_h_dist, d_trap_base, d_y_depth
     
-    def Calculate_Bathymetry_Based_on_RiverBank_Elevations(self, d_q_baseflow: float, d_slope_use: float, dm_output_bathymetry: np.ndarray):
+    def Calculate_Bathymetry_Based_on_RiverBank_Elevations(
+        self, 
+        d_q_baseflow: float, 
+        d_slope_use: float, 
+        dm_output_bathymetry: np.ndarray,
+        last_bankfull_wse_dict: dict[int, float],
+        comid: int,
+        upstream_comids: list[int]):
         """Estimate bathymetry using bank elevations (vs. a flat WSE signature).
 
         This routine attempts to identify bank locations/elevations and then
@@ -905,6 +912,26 @@ class CrossSection:
 
         # --- Adjust bathymetry on both profiles if valid banks were found --- #
         if i_total_bank_cells > 0:
+            if comid not in last_bankfull_wse_dict:
+                best_elevation = d_bankfull_elevation
+                for upstream_comid in upstream_comids:
+                    if upstream_comid in last_bankfull_wse_dict and last_bankfull_wse_dict[upstream_comid] > best_elevation: # We choose the upstream which has the highest bankfull elevation to use as the best estimate for this comid.
+                        best_elevation = last_bankfull_wse_dict[upstream_comid]
+                last_bankfull_wse_dict[comid] = best_elevation
+
+            if last_bankfull_wse_dict[comid] >= d_bankfull_elevation:
+                last_bankfull_wse_dict[comid] = d_bankfull_elevation
+            else:
+                # Recalculate depth using last bankfull elevation
+                (d_side1_dist, d_side2_dist, d_total_bank_dist, d_h_dist,
+                d_trap_base, d_y_depth) = self._compute_depth(
+                    i_total_bank_cells,
+                    i_bank_1_index, i_bank_2_index, last_bankfull_wse_dict[comid],
+                    d_q_baseflow, d_slope_use
+                )
+                # calculate the elevation of the bathy depth and re-calculate if higher than the bankfull elevation
+                d_y_bathy = last_bankfull_wse_dict[comid] - d_y_depth
+
             # Add 1 to the bank index to get to the actual bank cell
             _adjust_one_side_for_bathymetry(
                 i_bank_1_index + 1, d_total_bank_dist,
