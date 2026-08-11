@@ -26,6 +26,7 @@ import os
 import math
 import warnings
 from typing import Literal
+from pathlib import Path
 
 import tqdm
 import yaml
@@ -1438,6 +1439,69 @@ def initialize_stream_slope_dictionaries(params: dict, dx, dy, dem_geotransform,
     s_stream_slope_method = params['s_stream_slope_method']
     if s_stream_slope_method == 'reach_average' or s_stream_slope_method == 'local_average_corrected':
         dict_stream_slopes, dict_stream_slopes_25th, dict_stream_slopes_75th = create_reach_average_slope_dicts(_STREAMS, dx, dy, quiet, params['i_general_slope_distance'], processes)
+        bad_streams = set()
+        for stream_id in dict_stream_slopes.keys():
+            if dict_stream_slopes_25th[stream_id] == dict_stream_slopes_75th[stream_id]:
+                bad_streams.add(stream_id)
+        if bad_streams:
+            if not params['s_strmshp_path']:
+                LOG.error(f"Bad streams found: {bad_streams}. Please provide a stream vector file to calclulate slopes.")
+
+            strm_path = Path(params['s_strmshp_path'])
+            if strm_path.suffix in {'.pq', '.parquet'}:
+                gdf = pd.read_parquet(strm_path, columns=['LINKNO', 'DSLINKNO'])
+            else:
+                gdf = gpd.read_file(strm_path, columns=['LINKNO', 'DSLINKNO'], ignore_geometry=True)
+
+            import networkx as nx
+            G: nx.DiGraph = nx.from_pandas_edgelist(gdf, source='LINKNO', target='DSLINKNO', create_using=nx.DiGraph())
+            G.remove_node(-1)  # Remove the "no downstream" node
+            updated = True
+            while updated:
+                updated = False
+                to_remove = set()
+                for stream_id in bad_streams:
+                    if stream_id not in G:
+                        continue
+
+                    # Use upstream and downstream neighbors to estimate slope.
+                    # When there are multiple upstreams, chose the one that has more upstreams (i.e., the one that is more "main stem").
+                    upstream_neighbors = list(set(G.predecessors(stream_id)) - bad_streams)
+                    downstream_neighbors = list(set(G.successors(stream_id)) - bad_streams)
+                    upstream_slope = None
+                    downstream_slope = None
+                    if upstream_neighbors:
+                        if len(upstream_neighbors) > 1:
+                            upstream_neighbors.sort(key=lambda x: len(list(nx.ancestors(G, x))), reverse=True)
+                        upstream_slope = dict_stream_slopes.get(upstream_neighbors[0])
+                    if downstream_neighbors:
+                        downstream_slope = dict_stream_slopes.get(downstream_neighbors[0])
+
+                    if upstream_slope is not None and downstream_slope is not None:
+                        dict_stream_slopes[stream_id] = (upstream_slope + downstream_slope) / 2
+                        dict_stream_slopes_25th[stream_id] = dict_stream_slopes[stream_id]
+                        dict_stream_slopes_75th[stream_id] = dict_stream_slopes[stream_id]
+                        updated = True
+                        to_remove.add(stream_id)
+                    elif upstream_slope is not None:
+                        dict_stream_slopes[stream_id] = upstream_slope
+                        dict_stream_slopes_25th[stream_id] = upstream_slope
+                        dict_stream_slopes_75th[stream_id] = upstream_slope
+                        updated = True
+                        to_remove.add(stream_id)
+                    elif downstream_slope is not None:
+                        dict_stream_slopes[stream_id] = downstream_slope
+                        dict_stream_slopes_25th[stream_id] = downstream_slope
+                        dict_stream_slopes_75th[stream_id] = downstream_slope
+                        updated = True
+                        to_remove.add(stream_id)
+
+                bad_streams -= to_remove
+
+            if bad_streams:
+                LOG.error(f"Unable to estimate slopes for the following streams: {bad_streams}.")
+                raise ValueError(f"Unable to estimate slopes for the following streams: {bad_streams}.")
+
         return (dict_stream_slopes, dict_stream_slopes_25th, dict_stream_slopes_75th)
     elif s_stream_slope_method == 'end_points':
         dict_stream_slopes = dict_stream_slopes_from_endpoints(
@@ -1488,7 +1552,8 @@ def calculate_hydraulic_data_for_cell(i_entry_cell: int):
         manual_record = _MANUAL_CROSS_SECTION_RECORDS.get(int(i_cell_comid))
         if manual_record is None:
             raise KeyError(f"Manual cross section for ID {i_cell_comid} was not found.")
-
+    if i_cell_comid == 760554805:
+        pass
     # Get the Slope of each Stream Cell. Slope should be in m/m
     s_stream_slope_method = _PARAMS['s_stream_slope_method']
     dx = _PARAMS['dx']
