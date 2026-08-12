@@ -606,6 +606,8 @@ def read_main_input_file(s_mif_name: str, args: dict):
         'use_bathy_water_mask': to_bool(get_parameter_name(sl_lines,  'ARC_Use_BathyWaterMask', False)), # Find the true/false variable to use the bathymetry water mask
         'bathy_water_mask': get_parameter_name(sl_lines,  'BathyWaterMask', ''), # Find the path to the bathymetry water mask,
         'monotonic_bankfull_wse': to_bool(get_parameter_name(sl_lines, 'Monotonic_Bankfull_WSE', False)), # Find the true/false variable to enforce monotonic bankfull WSEs
+        "slope_low_percentile": int(get_parameter_name(sl_lines, 'Slope_Low_Percentile', 25)), # Find the low percentile for slope calculation
+        "slope_high_percentile": int(get_parameter_name(sl_lines, 'Slope_High_Percentile', 75)), # Find the high percentile for slope calculation
     }
 
     return params
@@ -883,8 +885,8 @@ def round_sig(x, sig=3):
     factor = 10.0 ** (sig - 1 - exp)
     return math.floor(x * factor + 0.5) / factor
 
-@njit(cache=True)
-def get_reach_median_stream_slope_information(dm_dem: np.ndarray, im_streams: np.ndarray, stream_id: int, d_dx: float, d_dy: float, i_general_slope_distance: int):
+@njit(cache=True, nogil=True)
+def get_reach_median_stream_slope_information(dm_dem: np.ndarray, im_streams: np.ndarray, stream_id: int, d_dx: float, d_dy: float, i_general_slope_distance: int, low, high):
     """
     Calculates the stream slope for each stream cell using the following process:
 
@@ -936,9 +938,6 @@ def get_reach_median_stream_slope_information(dm_dem: np.ndarray, im_streams: np
         # Not enough cells to define a slope
         return d_stream_slope, lower_bound, upper_bound
 
-    total_slope = 0.0
-    count = 0
-
     slope_list = []
 
     # Loop over all unique pairs (a, b), a < b
@@ -968,19 +967,14 @@ def get_reach_median_stream_slope_information(dm_dem: np.ndarray, im_streams: np
                 if dist > 0.0:
                     slope = np.round(abs(za - zb) / dist, 8)
                     if slope > 0.0:
-                        total_slope += slope
-                        count += 1
                         slope_list.append(slope)
 
     # remove any outliers using quartiles
     if len(slope_list) > 0:
         slope_arr = np.array(slope_list)
         slope_arr = round_sig(slope_arr, 8)   
-        Q1 = np.round(np.percentile(slope_arr, 25), 8)
-        Q3 = np.round(np.percentile(slope_arr, 75), 8)
-        IQR = Q3 - Q1
-        lower_bound = Q1
-        upper_bound = Q3
+        lower_bound = np.round(np.percentile(slope_arr, low), 8)
+        upper_bound = np.round(np.percentile(slope_arr, high), 8)
         slope_list = [x for x in slope_list if lower_bound <= x <= upper_bound]
 
     # Compute median slope
@@ -1284,7 +1278,7 @@ def flood_increments(i_number_of_increments: int, d_inc_y: float, flood_incremen
     prev_wse = 0.0
     sqrt_slope = d_slope_use**0.5
 
-    for i_entry_elevation in range(i_number_of_increments):
+    for i_entry_elevation in range(1, i_number_of_increments):
         d_wse = np.round(thalweg + d_inc_y * i_entry_elevation, 3)
 
         # Calculate the geometry          
@@ -1313,7 +1307,7 @@ def flood_increments(i_number_of_increments: int, d_inc_y: float, flood_incremen
             # if we reach the upper bound without a valid candidate, or we overshot, revert
             # also add a top‑level guard before saving the initial (non‑refined) Q
             # right after computing the first Q/V for this increment:
-            if (Q <= prev_q) or (Q > d_q_sum + 1.0):
+            if (Q <= prev_q) or (Q > d_q_sum * 1.01):
                 add_hydraulic_data(output_data, i_entry_elevation, prev_wse, prev_t, prev_p, prev_q, prev_v, i_entry_cell, b_modified_dem)
                 continue
 
@@ -1353,7 +1347,7 @@ def add_100_if_elevation_less_than_0(arr):
 def get_reach_median_stream_slope_information_wrapper(args):
     return get_reach_median_stream_slope_information(_DEM, _STREAMS, *args)
 
-def create_reach_average_slope_dicts(dm_stream, dx, dy, quiet, i_general_slope_distance, processes):
+def create_reach_average_slope_dicts(dm_stream, dx, dy, quiet, i_general_slope_distance, processes, low, high):
     # create a list of unique stream IDs to loop through
     unique_stream_ids = np.unique(dm_stream)
     unique_stream_ids = unique_stream_ids[unique_stream_ids > 0]
@@ -1363,7 +1357,7 @@ def create_reach_average_slope_dicts(dm_stream, dx, dy, quiet, i_general_slope_d
     dict_stream_slopes_75th = {}
     if processes == 1:
         for stream_id in pbar_slopes:
-            reach_slope, reach_slope_25th, reach_slope_75th = get_reach_median_stream_slope_information(_DEM, dm_stream, stream_id, dx, dy, i_general_slope_distance)
+            reach_slope, reach_slope_25th, reach_slope_75th = get_reach_median_stream_slope_information(_DEM, dm_stream, stream_id, dx, dy, i_general_slope_distance, low, high)
             dict_stream_slopes[stream_id] = reach_slope
             dict_stream_slopes_25th[stream_id] = reach_slope_25th
             dict_stream_slopes_75th[stream_id] = reach_slope_75th
@@ -1371,7 +1365,7 @@ def create_reach_average_slope_dicts(dm_stream, dx, dy, quiet, i_general_slope_d
         args = get_init_parallel_args(["_DEM", "_STREAMS"])
         with Pool(processes, initializer=init_parallel, initargs=args) as pool:
             chunksize = min(10, len(unique_stream_ids) // (processes * 4) + 1)  # Adjust chunksize based on the number of processes and total tasks. I found 10 to be the most we should go
-            for stream_id, (reach_slope, reach_slope_25th, reach_slope_75th) in zip(pbar_slopes, pool.imap(get_reach_median_stream_slope_information_wrapper, [(stream_id, dx, dy, i_general_slope_distance) for stream_id in unique_stream_ids], chunksize=chunksize)):
+            for stream_id, (reach_slope, reach_slope_25th, reach_slope_75th) in zip(pbar_slopes, pool.imap(get_reach_median_stream_slope_information_wrapper, [(stream_id, dx, dy, i_general_slope_distance, low, high) for stream_id in unique_stream_ids], chunksize=chunksize)):
                 dict_stream_slopes[stream_id] = reach_slope
                 dict_stream_slopes_25th[stream_id] = reach_slope_25th
                 dict_stream_slopes_75th[stream_id] = reach_slope_75th
@@ -1455,7 +1449,7 @@ def load_graph(strm_path):
 def initialize_stream_slope_dictionaries(params: dict, dx, dy, dem_geotransform, dem_projection, quiet, processes, i_boundary_number):
     s_stream_slope_method = params['s_stream_slope_method']
     if s_stream_slope_method == 'reach_average' or s_stream_slope_method == 'local_average_corrected':
-        dict_stream_slopes, dict_stream_slopes_25th, dict_stream_slopes_75th = create_reach_average_slope_dicts(_STREAMS, dx, dy, quiet, params['i_general_slope_distance'], processes)
+        dict_stream_slopes, dict_stream_slopes_25th, dict_stream_slopes_75th = create_reach_average_slope_dicts(_STREAMS, dx, dy, quiet, params['i_general_slope_distance'], processes, params['slope_low_percentile'], params['slope_high_percentile'])
         bad_streams = set()
         for stream_id in dict_stream_slopes.keys():
             if dict_stream_slopes_25th[stream_id] == dict_stream_slopes_75th[stream_id]:
