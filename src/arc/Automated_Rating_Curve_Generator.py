@@ -530,12 +530,12 @@ def read_main_input_file(s_mif_name: str, args: dict):
     ### Open and read the input file ###
     # Open the file
     if s_mif_name:
-        if s_mif_name.lower().endswith(('.yaml', '.yml')):
-            # If it's a YAML file, parse it with PyYAML and convert to the expected list of lines format
-            data = yaml.safe_load(open(s_mif_name))
-            sl_lines = [f"{key}\t{value}\n" for key, value in data.items()]
-        else:
-             with open(s_mif_name, 'r') as o_input_file:
+        with open(s_mif_name, 'r') as o_input_file:
+            if s_mif_name.lower().endswith(('.yaml', '.yml')):
+                # If it's a YAML file, parse it with PyYAML and convert to the expected list of lines format
+                data = yaml.load(o_input_file, Loader=yaml.CSafeLoader)
+                sl_lines = [f"{key}\t{value}\n" for key, value in data.items()]
+            else:
                 sl_lines = o_input_file.readlines()
     else:
         # Convert arg dict to a list of lines
@@ -886,61 +886,28 @@ def round_sig(x, sig=3):
     return math.floor(x * factor + 0.5) / factor
 
 @njit(cache=True, nogil=True)
-def get_reach_median_stream_slope_information(dm_dem: np.ndarray, im_streams: np.ndarray, stream_id: int, d_dx: float, d_dy: float, i_general_slope_distance: int, low, high):
-    """
-    Calculates the stream slope for each stream cell using the following process:
-
-        1.) Find all stream cells that have the same stream id value
-        2.) Look at the slope of each of the stream cells.
-        3.) Average the slopes to get the overall slope we use in the model.
-
-    Guaranteed to be >= 0.0002 and <= 0.03
-
-    Parameters
-    ----------
-    dm_dem: ndarray
-        Elevation raster
-    im_streams: ndarray
-        Stream raster
-    stream_id: int
-        ID of the stream for which to calculate slope
-    d_dx: float
-        Cell resolution in the x direction
-    d_dy: float
-        Cell resolution in the y direction
-    i_general_slope_distance: int
-        Distance in number of cells to look for slope calculations.
-
-    Returns
-    -------
-    d_stream_slope: float
-        Average slope from the stream cells in the specified search box
-    d_stream_slope_25: float
-        25th percentile slope from the stream cells in the specified search box
-    d_stream_slope_75: float
-        75th percentile slope from the stream cells in the specified search box
-
-    """
-
-    # Initialize a default stream flow
-    d_stream_slope = 0.0
-
-    # All cells in this reach (global indices)
-    reach_rows, reach_cols = np.where(im_streams == stream_id)
-    n = len(reach_rows)
-
-
-    d_stream_slope = 0.0002
+def get_reach_median_stream_slope_information(
+    dm_dem: np.ndarray,
+    reach_rows: np.ndarray,
+    reach_cols: np.ndarray,
+    d_dx: float,
+    d_dy: float,
+    i_general_slope_distance: int,
+    low,
+    high,
+):
     lower_bound = 0.0002
     upper_bound = 0.0002
 
+    # Find all cells in this reach.
+    n = len(reach_rows)
+
     if n < 2:
-        # Not enough cells to define a slope
-        return d_stream_slope, lower_bound, upper_bound
+        return 0.0002, lower_bound, upper_bound
 
     slope_list = []
 
-    # Loop over all unique pairs (a, b), a < b
+    # Only examine each spatial pair once.
     for a in range(n):
         ra = reach_rows[a]
         ca = reach_cols[a]
@@ -950,37 +917,41 @@ def get_reach_median_stream_slope_information(dm_dem: np.ndarray, im_streams: np
             rb = reach_rows[b]
             cb = reach_cols[b]
 
-            # Check if within the "box" in row/col space
             dr = rb - ra
             dc = cb - ca
 
-            if (dr >= -i_general_slope_distance and dr <= i_general_slope_distance and
-                dc >= -i_general_slope_distance and dc <= i_general_slope_distance):
+            if not (abs(dr) <= i_general_slope_distance and abs(dc) <= i_general_slope_distance):
+                continue 
 
-                zb = dm_dem[rb, cb]
+            dx = dc * d_dx
+            dy = dr * d_dy
 
-                # Horizontal distance
-                dx = dc * d_dx
-                dy = dr * d_dy
-                dist = math.sqrt(dx * dx + dy * dy)
+            dist = math.sqrt(dx * dx + dy * dy)
 
-                if dist > 0.0:
-                    slope = np.round(abs(za - zb) / dist, 8)
-                    if slope > 0.0:
-                        slope_list.append(slope)
+            if dist == 0.0:
+                continue
 
-    # remove any outliers using quartiles
+            slope = np.round(abs(za - dm_dem[rb, cb]) / dist, 8)
+
+            if slope > 0.0:
+                slope_list.append(slope)
+
+    # Remove outliers using quartiles.
     if len(slope_list) > 0:
         slope_arr = np.array(slope_list)
-        slope_arr = round_sig(slope_arr, 8)   
+        slope_arr = round_sig(slope_arr, 8)
+
         lower_bound = np.round(np.percentile(slope_arr, low), 8)
+
         upper_bound = np.round(np.percentile(slope_arr, high), 8)
+
         slope_list = [x for x in slope_list if lower_bound <= x <= upper_bound]
 
-    # Compute median slope
+    # Median slope.
     if len(slope_list) > 0:
         d_stream_slope = np.median(np.array(slope_list))
-
+    else:
+        d_stream_slope = 0.0002
 
     return d_stream_slope, lower_bound, upper_bound
 
@@ -1345,7 +1316,7 @@ def add_100_if_elevation_less_than_0(arr):
     return b_modified_dem
 
 def get_reach_median_stream_slope_information_wrapper(args):
-    return get_reach_median_stream_slope_information(_DEM, _STREAMS, *args)
+    return get_reach_median_stream_slope_information(_DEM, *args)
 
 def create_reach_average_slope_dicts(dm_stream, dx, dy, quiet, i_general_slope_distance, processes, low, high):
     # create a list of unique stream IDs to loop through
@@ -1355,9 +1326,29 @@ def create_reach_average_slope_dicts(dm_stream, dx, dy, quiet, i_general_slope_d
     dict_stream_slopes = {}
     dict_stream_slopes_25th = {}
     dict_stream_slopes_75th = {}
+
+    reach_rows = {}
+    reach_cols = {}
+
+    rows, cols = np.where(dm_stream > 0)
+
+    for r, c in zip(rows, cols):
+        sid = dm_stream[r, c]
+
+        if sid not in reach_rows:
+            reach_rows[sid] = []
+            reach_cols[sid] = []
+
+        reach_rows[sid].append(r)
+        reach_cols[sid].append(c)
+
+    for sid in reach_rows:
+        reach_rows[sid] = np.asarray(reach_rows[sid], dtype=np.int64)
+        reach_cols[sid] = np.asarray(reach_cols[sid], dtype=np.int64)
+
     if processes == 1:
         for stream_id in pbar_slopes:
-            reach_slope, reach_slope_25th, reach_slope_75th = get_reach_median_stream_slope_information(_DEM, dm_stream, stream_id, dx, dy, i_general_slope_distance, low, high)
+            reach_slope, reach_slope_25th, reach_slope_75th = get_reach_median_stream_slope_information(_DEM, reach_rows[stream_id], reach_cols[stream_id], dx, dy, i_general_slope_distance, low, high)
             dict_stream_slopes[stream_id] = reach_slope
             dict_stream_slopes_25th[stream_id] = reach_slope_25th
             dict_stream_slopes_75th[stream_id] = reach_slope_75th
@@ -1365,7 +1356,7 @@ def create_reach_average_slope_dicts(dm_stream, dx, dy, quiet, i_general_slope_d
         args = get_init_parallel_args(["_DEM", "_STREAMS"])
         with Pool(processes, initializer=init_parallel, initargs=args) as pool:
             chunksize = min(10, len(unique_stream_ids) // (processes * 4) + 1)  # Adjust chunksize based on the number of processes and total tasks. I found 10 to be the most we should go
-            for stream_id, (reach_slope, reach_slope_25th, reach_slope_75th) in zip(pbar_slopes, pool.imap(get_reach_median_stream_slope_information_wrapper, [(stream_id, dx, dy, i_general_slope_distance, low, high) for stream_id in unique_stream_ids], chunksize=chunksize)):
+            for stream_id, (reach_slope, reach_slope_25th, reach_slope_75th) in zip(pbar_slopes, pool.imap(get_reach_median_stream_slope_information_wrapper, [(reach_rows[stream_id], reach_cols[stream_id], dx, dy, i_general_slope_distance, low, high) for stream_id in unique_stream_ids], chunksize=chunksize)):
                 dict_stream_slopes[stream_id] = reach_slope
                 dict_stream_slopes_25th[stream_id] = reach_slope_25th
                 dict_stream_slopes_75th[stream_id] = reach_slope_75th
