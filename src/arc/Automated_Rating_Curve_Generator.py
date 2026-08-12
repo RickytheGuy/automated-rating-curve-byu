@@ -605,6 +605,7 @@ def read_main_input_file(s_mif_name: str, args: dict):
         's_output_flood': get_parameter_name(sl_lines,  'AROutFLOOD'), # Find the path to the output flood file
         'use_bathy_water_mask': to_bool(get_parameter_name(sl_lines,  'ARC_Use_BathyWaterMask', False)), # Find the true/false variable to use the bathymetry water mask
         'bathy_water_mask': get_parameter_name(sl_lines,  'BathyWaterMask', ''), # Find the path to the bathymetry water mask,
+        'monotonic_bankfull_wse': to_bool(get_parameter_name(sl_lines, 'Monotonic_Bankfull_WSE', False)), # Find the true/false variable to enforce monotonic bankfull WSEs
     }
 
     return params
@@ -1636,7 +1637,7 @@ def calculate_hydraulic_data_for_cell(i_entry_cell: int):
         x_section.Calculate_Bathymetry_Based_on_WSE_or_LC(d_q_baseflow, d_slope_use, _BATHYMETRY)
     #This method calculates the banks based on the Riverbank
     elif b_bathy_use_banks and s_output_bathymetry_path != '':
-        x_section.Calculate_Bathymetry_Based_on_RiverBank_Elevations(d_q_baseflow, d_slope_use, _BATHYMETRY, _LAST_BANKFULL_WSE, i_cell_comid, _UPSTREAM_COMID_MAP.get(i_cell_comid, []))
+        x_section.Calculate_Bathymetry_Based_on_RiverBank_Elevations(d_q_baseflow, d_slope_use, _BATHYMETRY, _LAST_BANKFULL_WSE, i_cell_comid, _UPSTREAM_COMID_MAP.get(i_cell_comid, []), _PARAMS["monotonic_bankfull_wse"])
 
     # Calculate the volumes
     # VolumeFillApproach 1 is to find the height within ElevList_mm that corresponds to the Qmax flow.  THen increment depths to have a standard number of depths to get to Qmax.  
@@ -2418,7 +2419,7 @@ def _main(MIF_Name: str, args: dict, quiet: bool = False, processes: int | Liter
             for flow_id in matching_flow_ids
         }
     else:
-        if b_bathy_use_banks:
+        if b_bathy_use_banks and params["monotonic_bankfull_wse"]:
             # Let us load in the COMIDs topographically. 
             G = load_graph(params["s_strmshp_path"])
             comids = []
