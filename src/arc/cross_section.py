@@ -52,7 +52,7 @@ class CrossSection:
     def __init__(self, 
                  dx: float, dy: float,
                  dm_elevation: np.ndarray, dm_land_use: np.ndarray,
-                 params: dict, bathy_water_mask: np.ndarray | None):
+                 params: dict):
         """Initialize a reusable sampler and allocate working arrays."""
         self.d_x_section_distance = params["d_x_section_distance"]
         self.i_center_point = int((self.d_x_section_distance / (sum([dx, dy]) * 0.5)) / 2.0) + 1
@@ -74,8 +74,6 @@ class CrossSection:
         self.i_lc_water_value = params["i_lc_water_value"]
         self.d_bathymetry_trapzoid_height = params["d_bathymetry_trapzoid_height"]
         self.b_bathy_use_banks = params["b_bathy_use_banks"]
-        self.use_bathy_water_mask = params["use_bathy_water_mask"]
-        self.bathy_water_mask = bathy_water_mask
         # self.create_cross_section_ordinates()
 
         # Find all the different angle increments to test
@@ -692,11 +690,7 @@ class CrossSection:
         self, 
         d_q_baseflow: float, 
         d_slope_use: float, 
-        dm_output_bathymetry: np.ndarray,
-        last_bankfull_wse_dict: dict[int, float],
-        comid: int,
-        upstream_comids: list[int],
-        monotonic_bankfull_wse: bool):
+        dm_output_bathymetry: np.ndarray,):
         """Estimate bathymetry using bank elevations (vs. a flat WSE signature).
 
         This routine attempts to identify bank locations/elevations and then
@@ -734,26 +728,7 @@ class CrossSection:
 
         # === First: find the bank information === #
         i_total_bank_cells = 0
-        if self.bathy_water_mask is not None and self.use_bathy_water_mask:
-            # Use bathy water mask to find the banks of the stream
-            if self.xs1_n >= 1 and self.bathy_water_mask[self.ia_xc_row1_index_main[0], self.ia_xc_column1_index_main[0]] > 0:
-                bank_elev_1 = self.da_xs_profile1[0]
-                for i in range(1, self.xs1_n):
-                    if self.bathy_water_mask[self.ia_xc_row1_index_main[i], self.ia_xc_column1_index_main[i]] == 0:
-                        bank_elev_1 = self.da_xs_profile1[i]
-                        i_bank_1_index = i - 1
-                        break
-            if self.xs2_n >= 1 and self.bathy_water_mask[self.ia_xc_row2_index_main[0], self.ia_xc_column2_index_main[0]] > 0:
-                bank_elev_2 = self.da_xs_profile2[0]
-                for i in range(1, self.xs2_n):
-                    if self.bathy_water_mask[self.ia_xc_row2_index_main[i], self.ia_xc_column2_index_main[i]] == 0:
-                        bank_elev_2 = self.da_xs_profile2[i]
-                        i_bank_2_index = i - 1
-                        break
-            i_total_bank_cells = i_bank_1_index + i_bank_2_index + 2
-            if i_total_bank_cells > 0:
-                function_used = "find_wse_and_banks_by_bathymask"
-        elif self.b_FindBanksBasedOnLandCover:
+        if self.b_FindBanksBasedOnLandCover:
             # Use land cover data to find the banks of the stream
             if self.xs1_n >= 1 and i_landcover_for_bathy == self.i_lc_water_value:
                 bank_elev_1 = self.da_xs_profile1[0]
@@ -818,7 +793,7 @@ class CrossSection:
             # calculate the elevation of the bathy depth and re-calculate if higher than the bankfull elevation
             d_y_bathy = d_bankfull_elevation - d_y_depth
             # If the estimated depth is an outlier, try alternate approaches
-            if d_y_depth >= 25 or d_y_bathy > d_bankfull_elevation and (function_used in {"find_wse_and_banks_by_lc",  "find_wse_and_banks_by_flat_water", "find_wse_and_banks_by_bathymask"}):
+            if d_y_depth >= 25 or d_y_bathy > d_bankfull_elevation and (function_used in {"find_wse_and_banks_by_lc",  "find_wse_and_banks_by_flat_water"}):
                 # Recalculate using width-to-depth ratio
                 (i_bank_1_index, i_bank_2_index) =  _find_bank_using_width_to_depth_ratio(base_elev, self.da_xs_profile1, self.da_xs_profile2, self.xs1_n, self.xs2_n, self.d_ordinate_dist)
                 i_total_bank_cells = i_bank_1_index + i_bank_2_index + 2
@@ -913,28 +888,6 @@ class CrossSection:
 
         # --- Adjust bathymetry on both profiles if valid banks were found --- #
         if i_total_bank_cells > 0:
-            if monotonic_bankfull_wse:
-                if comid not in last_bankfull_wse_dict:
-                    best_elevation = d_bankfull_elevation
-                    for upstream_comid in upstream_comids:
-                        if upstream_comid in last_bankfull_wse_dict and last_bankfull_wse_dict[upstream_comid] > best_elevation: # We choose the upstream which has the highest bankfull elevation to use as the best estimate for this comid.
-                            best_elevation = last_bankfull_wse_dict[upstream_comid]
-                    last_bankfull_wse_dict[comid] = best_elevation
-
-                if last_bankfull_wse_dict[comid] >= d_bankfull_elevation:
-                    last_bankfull_wse_dict[comid] = d_bankfull_elevation
-                else:
-                    # Recalculate depth using last bankfull elevation
-                    (d_side1_dist, d_side2_dist, d_total_bank_dist, d_h_dist,
-                    d_trap_base, d_y_depth) = self._compute_depth(
-                        i_total_bank_cells,
-                        i_bank_1_index, i_bank_2_index, last_bankfull_wse_dict[comid],
-                        d_q_baseflow, d_slope_use
-                    )
-                    # calculate the elevation of the bathy depth and re-calculate if higher than the bankfull elevation
-                    d_y_bathy = last_bankfull_wse_dict[comid] - d_y_depth
-
-            # Add 1 to the bank index to get to the actual bank cell
             _adjust_one_side_for_bathymetry(
                 i_bank_1_index + 1, d_total_bank_dist,
                 d_trap_base, d_h_dist, self.ia_xc_row1_index_main, self.ia_xc_column1_index_main,

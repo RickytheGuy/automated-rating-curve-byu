@@ -54,7 +54,6 @@ _STREAMS: np.ndarray = None
 _BATHYMETRY: np.ndarray = None
 _MANNINGS_N: np.ndarray = None
 _LAND_COVER: np.ndarray = None
-_BATHY_WATER_MASK: np.ndarray = None
 _OUTPUT_DATA_ARRAY: np.ndarray = None
 _OUT_FLOOD: np.ndarray = None
 _PARAMS: dict | None = None
@@ -74,15 +73,12 @@ _CELL_REACH_SLOPE: np.ndarray = None
 _CELL_SLOPE_25: np.ndarray = None
 _CELL_SLOPE_75: np.ndarray = None
 _MANUAL_CROSS_SECTION_RECORDS: dict[int, dict] | None = None
-_LAST_BANKFULL_WSE: dict[int, float] = {} # Maps a COMID to the last bankfull WSE
-_UPSTREAM_COMID_MAP: dict[int, list[int]] = {} # Maps a COMID to a list of upstream COMIDs
 
 ARRAY_NAMES = [
     '_DEM',
     '_STREAMS',
     '_BATHYMETRY',
     '_MANNINGS_N',
-    '_BATHY_WATER_MASK',
     '_LAND_COVER',
     '_OUTPUT_DATA_ARRAY',
     '_OUT_FLOOD',
@@ -603,9 +599,7 @@ def read_main_input_file(s_mif_name: str, args: dict):
         'b_FindBanksBasedOnLandCover': b_FindBanksBasedOnLandCover, # Find the true/false variable to find the banks of the river based on the land cover dataset instead of the DEM
         'b_reach_average_curve_file': b_reach_average_curve_file, # Find the true/false variable to use a reach-average curve file
         's_output_flood': get_parameter_name(sl_lines,  'AROutFLOOD'), # Find the path to the output flood file
-        'use_bathy_water_mask': to_bool(get_parameter_name(sl_lines,  'ARC_Use_BathyWaterMask', False)), # Find the true/false variable to use the bathymetry water mask
         'bathy_water_mask': get_parameter_name(sl_lines,  'BathyWaterMask', ''), # Find the path to the bathymetry water mask,
-        'monotonic_bankfull_wse': to_bool(get_parameter_name(sl_lines, 'Monotonic_Bankfull_WSE', False)), # Find the true/false variable to enforce monotonic bankfull WSEs
         "slope_low_percentile": int(get_parameter_name(sl_lines, 'Slope_Low_Percentile', 25)), # Find the low percentile for slope calculation
         "slope_high_percentile": int(get_parameter_name(sl_lines, 'Slope_High_Percentile', 75)), # Find the high percentile for slope calculation
     }
@@ -1569,7 +1563,7 @@ def calculate_hydraulic_data_for_cell(i_entry_cell: int):
         #Default to using the 'local_average' method
         d_slope_use = get_local_average_stream_slope_information(i_row_cell, i_column_cell, _DEM, _STREAMS, dx, dy, i_general_slope_distance)
 
-    x_section = get_cross_section(dx, dy, _DEM, _LAND_COVER, _PARAMS, _BATHY_WATER_MASK)
+    x_section = get_cross_section(dx, dy, _DEM, _LAND_COVER, _PARAMS)
     if using_manual_cross_sections:
         apply_manual_cross_section_data(x_section, manual_record)
     else:
@@ -1622,7 +1616,7 @@ def calculate_hydraulic_data_for_cell(i_entry_cell: int):
         x_section.Calculate_Bathymetry_Based_on_WSE_or_LC(d_q_baseflow, d_slope_use, _BATHYMETRY)
     #This method calculates the banks based on the Riverbank
     elif b_bathy_use_banks and s_output_bathymetry_path != '':
-        x_section.Calculate_Bathymetry_Based_on_RiverBank_Elevations(d_q_baseflow, d_slope_use, _BATHYMETRY, _LAST_BANKFULL_WSE, i_cell_comid, _UPSTREAM_COMID_MAP.get(i_cell_comid, []), _PARAMS["monotonic_bankfull_wse"])
+        x_section.Calculate_Bathymetry_Based_on_RiverBank_Elevations(d_q_baseflow, d_slope_use, _BATHYMETRY)
 
     # Calculate the volumes
     # VolumeFillApproach 1 is to find the height within ElevList_mm that corresponds to the Qmax flow.  THen increment depths to have a standard number of depths to get to Qmax.  
@@ -2285,12 +2279,6 @@ def _main(MIF_Name: str, args: dict, quiet: bool = False, processes: int | Liter
     dm_stream, sncols, snrows, scellsize, syll, syur, sxll, sxur, slat, strm_geotransform, strm_projection, maxx, miny, dy = read_and_pad_and_maybe_make_shared(params['s_input_stream_path'], processes, i_boundary_number, np.int64, "_STREAMS")
     dm_land_use, lncols, lnrows, lcellsize, lyll, lyur, lxll, lxur, llat, land_geotransform, land_projection, maxx, miny, dy = read_and_pad_and_maybe_make_shared(params['s_input_land_use_path'], processes, i_boundary_number, np.uint8, "_LAND_COVER")
 
-    if params["use_bathy_water_mask"]:
-        if not params["bathy_water_mask"]:
-            LOG.error("BathyWaterMask is required when ARC_Use_BathyWaterMask is True.")
-            return
-        read_and_pad_and_maybe_make_shared(params['bathy_water_mask'], processes, i_boundary_number, np.uint8, "_BATHY_WATER_MASK")
-
     ### Determine if the rasters are in a projected coordinate system (units in meters) or geographic coordinate system (units in degrees)
     if 'PROJCS' in dem_projection:
         LOG.info('Rasters are in a projected coordinate system with units in meters.')
@@ -2404,37 +2392,8 @@ def _main(MIF_Name: str, args: dict, quiet: bool = False, processes: int | Liter
             for flow_id in matching_flow_ids
         }
     else:
-        if b_bathy_use_banks and params["monotonic_bankfull_wse"]:
-            # Let us load in the COMIDs topographically. 
-            G = load_graph(params["s_strmshp_path"])
-            comids = []
-            all_rows = []
-            all_cols = []
-            for comid in nx.topological_sort(G):
-                if comid not in id_flow_dict:
-                    continue
-
-                upstreams = list(G.predecessors(comid))
-                _UPSTREAM_COMID_MAP[comid] = upstreams
-                downstream = next(iter(G.successors(comid)), -1)
-
-                rows, cols = get_rows_and_cols_for_stream_in_descending_order(
-                    comid,
-                    upstreams,
-                    downstream,
-                    dm_stream,
-                    dm_elevation
-                )
-                comids.extend([comid] * len(rows))
-                all_rows.extend(rows)
-                all_cols.extend(cols)
-
-            ia_valued_row_indices = np.asarray(all_rows, dtype=np.int64)
-            ia_valued_column_indices = np.asarray(all_cols, dtype=np.int64)
-            create_array("_CELL_COMIDS", processes, (ia_valued_row_indices.size,), np.int64)[:] = np.asarray(comids, dtype=np.int64)
-        else:
-            ia_valued_row_indices, ia_valued_column_indices = np.where(np.isin(dm_stream, flow_ids, kind='table'))
-            create_array("_CELL_COMIDS", processes, (ia_valued_row_indices.size,), np.int64)[:] = dm_stream[ia_valued_row_indices, ia_valued_column_indices]
+        ia_valued_row_indices, ia_valued_column_indices = np.where(np.isin(dm_stream, flow_ids, kind='table'))
+        create_array("_CELL_COMIDS", processes, (ia_valued_row_indices.size,), np.int64)[:] = dm_stream[ia_valued_row_indices, ia_valued_column_indices]
 
     for arr, name in zip([ia_valued_row_indices, ia_valued_column_indices], ["_CELL_ROWS", "_CELL_COLS"]):
         create_array(name, processes, arr.shape, arr.dtype)[:] = arr[:]
