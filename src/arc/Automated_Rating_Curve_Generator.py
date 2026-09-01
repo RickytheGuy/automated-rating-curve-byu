@@ -4260,7 +4260,7 @@ def _estimate_network_smoothed_reach_min_bank_elevations(
             if predecessor_id in reach_grades
         ]
         outlet_grade = (
-            max(np.nanmedian(inherited_grades)), minimum_grade
+            max(np.nanmedian(inherited_grades), minimum_grade)
             if inherited_grades
             else minimum_grade
         )
@@ -4395,7 +4395,7 @@ def _estimate_network_smoothed_reach_min_bank_elevations(
             if successor_id in reach_grades
         ]
         reach_grades[headwater_reach_id] = (
-            max(np.nanmedian(downstream_grades)), minimum_grade
+            max(np.nanmedian(downstream_grades), minimum_grade)
             if len(downstream_grades) > 0
             else minimum_grade
         )
