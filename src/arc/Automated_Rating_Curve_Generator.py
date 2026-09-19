@@ -2492,12 +2492,21 @@ def _smooth_reach_excavated_bed_elevations(
     sampled_records: list[dict | None],
     params: dict,
     window_size: int = 5,
-    max_elevation_rate: float = 0.01,
+    max_depth_change_rate: float = 0.01,
 ) -> None:
     """Smooths solved channel bed elevations (z_bed = z_bank - y) across the
-    network using moving-window filtering, rate-of-change constraints 
-    (|dz_bed/dx| <= max_elevation_rate), and network confluence continuity.
-    Updates 'bathymetry_depth' (y = z_bank - z_bed) in-place.
+    network using moving-window filtering, rate-of-change constraints, and
+    network confluence continuity. Updates 'bathymetry_depth' (y = z_bank -
+    z_bed) in-place.
+
+    The filtering and the rate-of-change constraints act on the excavation
+    depth y rather than on the absolute bed elevation, so the limit is
+    |dy/dx| <= max_depth_change_rate. A bed necessarily falls at its own
+    reach's longitudinal slope; limiting |dz_bed/dx| directly instead held the
+    bed flat on every reach steeper than the limit, and because the bed was
+    handed across each confluence the flattening accumulated down the network.
+    Where that happened z_bed rose above z_bank and y collapsed to zero, so
+    steep reaches received no excavated channel at all.
     """
     if not sampled_records:
         return
@@ -2527,7 +2536,7 @@ def _smooth_reach_excavated_bed_elevations(
         })
 
     upstream_to_downstream_reaches = list(nx.topological_sort(reach_network_graph))
-    reach_end_bed_elevations: dict[int, float] = {}
+    reach_end_depths: dict[int, float] = {}
 
     dx = float(params.get("dx", 1.0))
     dy = float(params.get("dy", 1.0))
@@ -2554,10 +2563,9 @@ def _smooth_reach_excavated_bed_elevations(
         if num_cells == 0:
             continue
 
-        # Extract raw z_bank, depth y, and calculate raw z_bed = z_bank - y
+        # Extract raw z_bank and the staged depth y below it
         z_bank_raw = np.zeros(num_cells, dtype=np.float64)
         raw_depths = np.zeros(num_cells, dtype=np.float64)
-        z_bed_raw = np.zeros(num_cells, dtype=np.float64)
         entry_indices = np.zeros(num_cells, dtype=np.int64)
 
         for pos_idx, pos in enumerate(order):
@@ -2570,64 +2578,64 @@ def _smooth_reach_excavated_bed_elevations(
                 y_val = float(bk.get("bathymetry_depth", 0.0))
                 z_bank_raw[pos_idx] = z_b
                 raw_depths[pos_idx] = y_val
-                z_bed_raw[pos_idx] = z_b - y_val
 
-        # Step 1: Moving-Window Median Filtering on z_bed
-        z_bed_smoothed = z_bed_raw.copy()
+        # Step 1: Moving-Window Median Filtering on the excavation depth
+        depth_smoothed = raw_depths.copy()
         for i in range(num_cells):
             i_min = max(0, i - pad)
             i_max = min(num_cells, i + pad + 1)
-            z_bed_smoothed[i] = np.median(z_bed_raw[i_min:i_max])
+            depth_smoothed[i] = np.median(raw_depths[i_min:i_max])
 
         # Step 2: Confluence Boundary Hand-off from Upstream Reaches
         predecessors = list(reach_network_graph.predecessors(reach_id))
-        pred_beds = [
-            reach_end_bed_elevations[p] for p in predecessors 
-            if p in reach_end_bed_elevations and np.isfinite(reach_end_bed_elevations[p])
+        pred_depths = [
+            reach_end_depths[p] for p in predecessors
+            if p in reach_end_depths and np.isfinite(reach_end_depths[p])
         ]
-        if pred_beds:
-            min_upstream_bed = float(np.min(pred_beds))
+        if pred_depths:
+            min_upstream_depth = float(np.min(pred_depths))
             dist_from_start = max(stations[0], 0.1)
-            max_delta = max_elevation_rate * dist_from_start
-            z_bed_smoothed[0] = np.clip(
-                z_bed_smoothed[0], 
-                min_upstream_bed - max_delta, 
-                min_upstream_bed + max_delta
+            max_delta = max_depth_change_rate * dist_from_start
+            depth_smoothed[0] = np.clip(
+                depth_smoothed[0],
+                min_upstream_depth - max_delta,
+                min_upstream_depth + max_delta
             )
 
-        # Step 3: Forward Pass - Rate of Change Constraint (|dz_bed/dx| <= max_elevation_rate)
+        # Step 3: Forward Pass - Rate of Change Constraint (|dy/dx| <= max_depth_change_rate)
         for i in range(num_cells - 1):
             dist_step = max(stations[i + 1] - stations[i], 0.1)
-            max_delta = max_elevation_rate * dist_step
-            z_bed_smoothed[i + 1] = np.clip(
-                z_bed_smoothed[i + 1], 
-                z_bed_smoothed[i] - max_delta, 
-                z_bed_smoothed[i] + max_delta
+            max_delta = max_depth_change_rate * dist_step
+            depth_smoothed[i + 1] = np.clip(
+                depth_smoothed[i + 1],
+                depth_smoothed[i] - max_delta,
+                depth_smoothed[i] + max_delta
             )
 
         # Step 4: Backward Pass - Rate of Change Constraint (Symmetry)
         for i in range(num_cells - 2, -1, -1):
             dist_step = max(stations[i + 1] - stations[i], 0.1)
-            max_delta = max_elevation_rate * dist_step
-            z_bed_smoothed[i] = np.clip(
-                z_bed_smoothed[i], 
-                z_bed_smoothed[i + 1] - max_delta, 
-                z_bed_smoothed[i + 1] + max_delta
+            max_delta = max_depth_change_rate * dist_step
+            depth_smoothed[i] = np.clip(
+                depth_smoothed[i],
+                depth_smoothed[i + 1] - max_delta,
+                depth_smoothed[i + 1] + max_delta
             )
 
-        # Store ending bed elevation for downstream successors
-        reach_end_bed_elevations[reach_id] = float(z_bed_smoothed[-1])
+        depth_smoothed = np.maximum(depth_smoothed, 0.0)
 
-        # Step 5: Recompute depth y = z_bank - z_bed and update sampled_records
+        # Store ending depth for downstream successors
+        reach_end_depths[reach_id] = float(depth_smoothed[-1])
+
+        # Step 5: Apply the smoothed depth and record its bed elevation
         for pos_idx, entry_idx in enumerate(entry_indices):
             rec = sampled_records[entry_idx]
             if rec and isinstance(rec.get("bank_search_result"), dict):
                 bk = rec["bank_search_result"]
                 z_bank = z_bank_raw[pos_idx]
-                z_bed_final = z_bed_smoothed[pos_idx]
 
-                # Recalculate depth required to reach the smoothed bed
-                y_final = max(z_bank - z_bed_final, 0.0) if np.isfinite(z_bank) else raw_depths[pos_idx]
+                y_final = float(depth_smoothed[pos_idx]) if np.isfinite(z_bank) else raw_depths[pos_idx]
+                z_bed_final = z_bank - y_final
 
                 bk["bathymetry_depth_raw_un-smoothed"] = float(raw_depths[pos_idx])
                 bk["bathymetry_depth"] = float(y_final)
@@ -3764,6 +3772,55 @@ def _fill_segment(
             path_smoothed[idx] = smoothed_elevation
 
 
+def _fit_monotone_decreasing_bank_profile(
+    values: np.ndarray,
+    stations: np.ndarray,
+    minimum_grade: float,
+) -> np.ndarray:
+    """Fit the closest profile to ``values`` that always falls downstream.
+
+    The result is the least-squares sequence satisfying
+    ``fit[i + 1] <= fit[i] - minimum_grade * (stations[i + 1] - stations[i])``.
+    Adding ``minimum_grade * station`` to every value removes the mandatory
+    fall and leaves ordinary non-increasing isotonic regression, which the
+    pool-adjacent-violators algorithm solves exactly in a single pass.
+
+    Averaging the pooled violators is what separates this from a running
+    minimum: one spuriously low bank observation is blended into its own
+    neighborhood instead of clamping every cell downstream of it.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    stations = np.asarray(stations, dtype=np.float64)
+    if values.size <= 1:
+        return values.copy()
+
+    detrended = values + float(minimum_grade) * stations
+    block_means = np.empty(values.size, dtype=np.float64)
+    block_sizes = np.empty(values.size, dtype=np.int64)
+    block_count = 0
+    for value in detrended:
+        block_means[block_count] = value
+        block_sizes[block_count] = 1
+        block_count += 1
+        # Pool while the newest block sits above the block upstream of it.
+        while (
+            block_count > 1
+            and block_means[block_count - 1] > block_means[block_count - 2]
+        ):
+            merged_size = (
+                block_sizes[block_count - 1] + block_sizes[block_count - 2]
+            )
+            block_means[block_count - 2] = (
+                block_means[block_count - 1] * block_sizes[block_count - 1]
+                + block_means[block_count - 2] * block_sizes[block_count - 2]
+            ) / merged_size
+            block_sizes[block_count - 2] = merged_size
+            block_count -= 1
+
+    fit = np.repeat(block_means[:block_count], block_sizes[:block_count])
+    return fit - float(minimum_grade) * stations
+
+
 def _anchor_interpolated_bank_surface_to_cell_observations(
     observed_cell_minimum_bank_elevations: np.ndarray,
     interpolated_bank_elevations: np.ndarray,
@@ -3776,33 +3833,41 @@ def _anchor_interpolated_bank_surface_to_cell_observations(
     lower_bound: float = -np.inf,
     upper_bound: float = np.inf,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Build a downstream-monotonic surface using cell observations as anchors.
+    """Fit a downstream-monotonic bank surface to this reach's observations.
 
-    Cells must be ordered from upstream to downstream. At each cell, ARC first
-    predicts an elevation from the active upstream anchor and slope. Before an
-    observation can become an anchor, it must fall within the reach-level
-    ``lower_bound`` and ``upper_bound`` and, when a finite thalweg is available,
-    it must be detectably higher than that cell's thalweg. If the filtered
-    observation is lower than the prediction, the observation becomes a new
-    anchor. ARC recalculates the grade between the nearest upstream anchor and
-    that new low point and rewrites every cell in that interval using the
-    fitted grade. At the new anchor, ARC then resets the outgoing grade toward
-    the fixed reach-outlet control. A later lower observation repeats the
-    process from the most recently accepted anchor. The monotonic cap remains
-    in place as a defensive constraint, so every accepted anchor and
-    interpolated cell supplies ``minimum_grade`` from the prior cell. An
-    outlet-feasibility floor also prevents an observation from pulling the
-    extrapolated surface below the network outlet. Thus a valid lower
-    observation adjusts its approaching segment instead of creating an
-    immediate drop or propagating an unbounded steep grade downstream. For a
-    non-headwater reach, ``upstream_control_ceiling`` also prevents the first
-    cell from rising above the incoming network control.
+    Cells must be ordered from upstream to downstream. An observation is
+    eligible when it falls within the reach-level ``lower_bound`` and
+    ``upper_bound`` and, when a finite thalweg is available, is detectably
+    higher than that cell's bed. Eligible observations *are* the surface: they
+    are interpolated across cells whose local bank search failed and then fitted
+    with :func:`_fit_monotone_decreasing_bank_profile`, which returns the
+    nearest profile that still falls by ``minimum_grade`` between consecutive
+    cells. ``interpolated_bank_elevations`` - the straight network line between
+    the reach's endpoint controls - is used only where the reach supplied no
+    eligible observation at all.
+
+    Fitting the observations in both directions is deliberate. An earlier
+    version accepted an observation only when it sat *below* the network line,
+    so a reach whose longitudinal profile is not a straight line kept the line
+    wherever the real banks were higher. On a steep reach, where the endpoint
+    controls are separated by a large relief, that placed the bank surface tens
+    of metres beneath the terrain and the bathymetry burned an equally deep
+    trench.
+
+    Three network constraints are then applied. ``upstream_control_ceiling``
+    keeps the reach under the lowest incoming control, the reach-outlet control
+    is both a floor for the whole reach and the value carried by its last cell,
+    and finally no cell may sit below the bed of its own cross section. The bed
+    floor uses the running minimum of ``thalweg_elevations`` so an isolated DEM
+    spike in the bed cannot lift the profile, and any cell it raises is followed
+    by lifting the cells upstream of it rather than lowering the cell itself.
 
     Returns
     -------
     tuple
         ``(surface, outgoing_grades, observation_anchor_mask)``. The outgoing
-        grade at a cell is the slope used to predict the next downstream cell.
+        grade at a cell is the fitted fall toward the next downstream cell, and
+        the mask marks the cells whose own observation entered the fit.
     """
     observed = np.asarray(
         observed_cell_minimum_bank_elevations,
@@ -3834,10 +3899,10 @@ def _anchor_interpolated_bank_surface_to_cell_observations(
             np.zeros(0, dtype=bool),
         )
 
-    # Build the anchor-eligibility mask once so the first cell and all later
-    # cells use exactly the same reach outlier and thalweg tests. Non-finite
-    # thalwegs do not disqualify an otherwise valid bank observation because
-    # there is no local bed elevation against which it can be checked.
+    # Decide once which observations may enter the fit, so every cell uses the
+    # same reach outlier and thalweg tests. Non-finite thalwegs do not
+    # disqualify an otherwise valid bank observation because there is no local
+    # bed elevation against which it can be checked.
     valid_observation_mask = (
         np.isfinite(observed)
         & (observed >= lower_bound)
@@ -3857,155 +3922,92 @@ def _anchor_interpolated_bank_surface_to_cell_observations(
     if not np.isfinite(reach_length) or reach_length <= 0.0:
         reach_length = 1.0
     minimum_grade = float(max(minimum_grade, 0.0))
+    downstream_control_elevation = float(downstream_control_elevation)
     stations = np.maximum.accumulate(
         np.clip(fractions, 0.0, 1.0) * reach_length
     )
 
-    surface = np.empty_like(interpolated)
-    outgoing_grades = np.full_like(interpolated, minimum_grade)
-    anchor_mask = np.zeros(observed.size, dtype=bool)
-
-    def _grade_to_outlet(anchor_station: float, anchor_elevation: float) -> float:
-        remaining_distance = reach_length - anchor_station
-        if remaining_distance <= 0.0:
-            return minimum_grade
-        return float(
-            max(
-                (anchor_elevation - downstream_control_elevation)
-                / remaining_distance,
-                minimum_grade,
-            )
+    # The observed banks define the shape of the surface. Cells whose own bank
+    # search failed are carried between the observations that bracket them, and
+    # np.interp holds the end observations flat beyond the observed span rather
+    # than extrapolating a grade that no cell measured. Only a reach with no
+    # eligible observation at all falls back to the straight network line.
+    if np.any(valid_observation_mask):
+        observed_profile = np.interp(
+            stations,
+            stations[valid_observation_mask],
+            observed[valid_observation_mask],
         )
+    else:
+        observed_profile = interpolated.copy()
 
-    def _minimum_outlet_feasible_elevation(station: float) -> float:
-        """Return the lowest anchor that can still reach the outlet safely."""
-        remaining_distance = max(reach_length - station, 0.0)
-        return float(
-            downstream_control_elevation
-            + minimum_grade * remaining_distance
-        )
+    surface = _fit_monotone_decreasing_bank_profile(
+        observed_profile,
+        stations,
+        minimum_grade,
+    )
 
-    anchor_station = float(stations[0])
-    anchor_elevation = float(interpolated[0])
-    if valid_observation_mask[0] and float(observed[0]) < anchor_elevation:
-        anchor_elevation = float(observed[0])
-        anchor_mask[0] = True
+    # A reach below a confluence cannot start above the lowest control flowing
+    # into it. Subtracting the mandatory grade carries that cap downstream so
+    # the capped section keeps falling instead of running flat.
     if (
         upstream_control_ceiling is not None
         and np.isfinite(upstream_control_ceiling)
-        and anchor_elevation > float(upstream_control_ceiling)
     ):
-        anchor_elevation = float(upstream_control_ceiling)
-        # A fully capped observation did not alter the interpolation and is not
-        # treated as an active anchor in the output diagnostics.
-        anchor_mask[0] = not np.isclose(
-            anchor_elevation,
-            float(interpolated[0]),
+        surface = np.minimum(
+            surface,
+            float(upstream_control_ceiling) - minimum_grade * stations,
         )
-    # A first-cell observation cannot be used below the elevation required to
-    # reach the fixed outlet while retaining the minimum downstream grade.
-    anchor_elevation = max(
-        anchor_elevation,
-        _minimum_outlet_feasible_elevation(anchor_station),
+
+    # The reach-outlet control is the floor the surface stays above so the next
+    # reach downstream never begins above its own incoming control, and the last
+    # cell is the outlet, so it carries that control directly.
+    outlet_floor = downstream_control_elevation + minimum_grade * np.maximum(
+        reach_length - stations,
+        0.0,
     )
-    surface[0] = anchor_elevation
-    anchor_index = 0
-    active_grade = _grade_to_outlet(anchor_station, anchor_elevation)
-    outgoing_grades[0] = active_grade
+    outlet_floor[-1] = downstream_control_elevation
+    surface = np.maximum(surface, outlet_floor)
+    surface[-1] = min(float(surface[-1]), downstream_control_elevation)
 
-    for cell_index in range(1, observed.size):
-        station = float(stations[cell_index])
-        distance_from_anchor = max(station - anchor_station, 0.0)
-        predicted_elevation = (
-            anchor_elevation - active_grade * distance_from_anchor
-        )
-
-        # An observation below the active line becomes the next anchor only
-        # after it passes the reach bounds and thalweg filter. Comparing with
-        # the active line (rather than the original baseline) ensures each new
-        # anchor is evaluated against the grade established by the prior one.
-        cell_distance = max(
-            station - float(stations[cell_index - 1]),
-            0.0,
-        )
-        maximum_monotonic_elevation = (
-            float(surface[cell_index - 1])
-            - minimum_grade * cell_distance
-        )
-
-        # Do not accept a low anchor beneath the elevation from which the
-        # fixed outlet can still be reached at ``minimum_grade``. Clipping an
-        # extreme observation to this floor preserves its lowering influence
-        # without allowing the downstream interpolation to run below zero or
-        # below the network-estimated outlet merely through extrapolation.
-        feasible_observation_elevation = max(
-            float(observed[cell_index]),
-            _minimum_outlet_feasible_elevation(station),
-        ) if valid_observation_mask[cell_index] else np.nan
-        observation_used = (
-            valid_observation_mask[cell_index]
-            and feasible_observation_elevation < predicted_elevation
-        )
-
-        if observation_used:
-            new_anchor_elevation = min(
-                feasible_observation_elevation,
-                maximum_monotonic_elevation,
+    # Last, no bank may sit below the bed of its own cross section. The running
+    # minimum keeps an isolated high spike in the sampled bed from lifting the
+    # profile, and re-imposing the fall by lifting upstream cells means this
+    # guard can only ever raise the surface.
+    if thalwegs is not None:
+        finite_thalweg_mask = np.isfinite(thalwegs)
+        if np.any(finite_thalweg_mask):
+            bed_floor = np.minimum.accumulate(
+                np.where(finite_thalweg_mask, thalwegs, np.inf)
             )
-            anchor_distance = station - anchor_station
+            bed_floor = np.where(np.isfinite(bed_floor), bed_floor, -np.inf)
+            surface = np.maximum(surface, bed_floor)
+            surface = np.maximum.accumulate(surface[::-1])[::-1]
 
-            if anchor_distance > 0.0:
-                # Fit the full interval to the newly discovered low point.
-                # Rewriting this interval distributes the elevation change
-                # between anchors instead of preserving a sharp one-cell step.
-                active_grade = max(
-                    (anchor_elevation - new_anchor_elevation)
-                    / anchor_distance,
-                    minimum_grade,
-                )
-                segment_slice = slice(anchor_index, cell_index + 1)
-                distances_from_upstream_anchor = np.maximum(
-                    stations[segment_slice] - anchor_station,
-                    0.0,
-                )
-                # Rewrite the complete segment as one vectorized operation;
-                # accepted-anchor intervals do not overlap except at their
-                # endpoint, so the complete pass remains linear in cell count.
-                surface[segment_slice] = (
-                    anchor_elevation
-                    - active_grade * distances_from_upstream_anchor
-                )
-                # The approaching grade applies through the cell immediately
-                # upstream of the new anchor. The new anchor receives a fresh
-                # outgoing grade toward the reach outlet below.
-                outgoing_grades[anchor_index:cell_index] = active_grade
-            else:
-                # Repeated station values provide no distance over which to
-                # calculate a new grade. Retain the active grade while still
-                # accepting the lower elevation as the local anchor.
-                surface[cell_index] = new_anchor_elevation
+    # Report the fall that the fitted surface actually uses between each cell
+    # and the next, so the exported grade matches the exported elevations.
+    outgoing_grades = np.full(surface.size, minimum_grade, dtype=np.float64)
+    if surface.size > 1:
+        cell_distances = np.diff(stations)
+        elevation_drops = -np.diff(surface)
+        segment_grades = np.divide(
+            elevation_drops,
+            cell_distances,
+            out=np.full(cell_distances.shape, minimum_grade, dtype=np.float64),
+            where=cell_distances > 0.0,
+        )
+        outgoing_grades[:-1] = np.maximum(segment_grades, minimum_grade)
+    remaining_distance = reach_length - float(stations[-1])
+    if remaining_distance > 0.0:
+        outgoing_grades[-1] = max(
+            (float(surface[-1]) - downstream_control_elevation)
+            / remaining_distance,
+            minimum_grade,
+        )
+    elif surface.size > 1:
+        outgoing_grades[-1] = float(outgoing_grades[-2])
 
-            # Make the accepted low point the nearest upstream anchor for the
-            # next segment, but do not extrapolate its steep approaching grade.
-            # Reset the active grade toward the fixed outlet so the surface is
-            # bounded. A later low observation will back-fit only the interval
-            # beginning here and will then perform the same outlet reset.
-            anchor_index = cell_index
-            anchor_station = station
-            anchor_elevation = float(surface[cell_index])
-            anchor_mask[cell_index] = True
-            active_grade = _grade_to_outlet(
-                anchor_station,
-                anchor_elevation,
-            )
-        else:
-            surface[cell_index] = min(
-                predicted_elevation,
-                maximum_monotonic_elevation,
-            )
-        outgoing_grades[cell_index] = active_grade
-
-    return surface, outgoing_grades, anchor_mask
+    return surface, outgoing_grades, valid_observation_mask.copy()
 
 def _reach_length(reach_id: int,
                   reach_network_graph: nx.DiGraph,) -> float:
@@ -4049,16 +4051,14 @@ def _estimate_network_smoothed_reach_min_bank_elevations(
     selected grade is stored on the graph node as ``bank_elevation_grade`` for
     :func:`_interpolate_reach_bank_elevation_surface`.
 
-    When ``reach_cell_bank_observations`` is supplied, the function also
-    interpolates each reach to its ordered cells and walks those cells from
-    upstream to downstream. An observed minimum below the active interpolation
-    becomes a new anchor. The slope from the nearest upstream anchor to the new
-    low point is recalculated and applied across that interval. From the new
-    anchor, the outgoing slope is reset toward the fixed reach outlet until
-    another lower observation establishes the next segment. Every consecutive
-    cell is constrained to fall by at least ``MIN_SLOPE``, and accepted anchors
-    are kept high enough to reach the outlet without crossing beneath it. The
-    anchored surface, anchor mask, and per-cell outgoing grades are stored on
+    When ``reach_cell_bank_observations`` is supplied, the function also builds
+    each reach's per-cell surface by fitting the reach's own filtered bank
+    observations with a monotonically falling profile, using the straight
+    endpoint-to-endpoint line only where a reach supplied no usable observation.
+    Every consecutive cell falls by at least ``MIN_SLOPE``, the surface stays
+    under the lowest incoming control and above both the reach outlet and the
+    bed of each cross section. The fitted surface, the mask of cells that
+    contributed an observation, and the per-cell outgoing grades are stored on
     the corresponding graph node for the final mapping pass in
     :func:`_smooth_reach_bank_elevations`.
 
@@ -5096,10 +5096,11 @@ def _smooth_reach_bank_elevations(
     its grade between the lowest incoming predecessor minimum and its own
     lowest filtered bank. An isolated reach uses its filtered maximum and
     minimum to infer flow direction and construct its initial grade. ARC then
-    walks the cells upstream-to-downstream, using lower filtered banks as
-    anchors for refitted monotonic segments. The
-    interpolated elevation remains only the vertical bathymetry control while
-    the filtered local bank indices and top width are preserved for each
+    fits each reach's own filtered bank observations with a monotonically
+    falling profile, keeping that profile under the reach's incoming network
+    control and above both its outlet control and the bed of every cross
+    section. The fitted elevation remains only the vertical bathymetry control
+    while the filtered local bank indices and top width are preserved for each
     sampled cross section.
     """
     # Source-stream IDs preserve the original reach grouping when processing
