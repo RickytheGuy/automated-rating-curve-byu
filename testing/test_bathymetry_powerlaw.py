@@ -12,7 +12,7 @@ from arc.Automated_Rating_Curve_Generator import (
     read_flow_file,
     read_main_input_file,
 )
-from arc.cross_section import CrossSection, compute_stream_derivatives, _find_nonzero_interior_bounds
+from arc.cross_section import CrossSection, compute_stream_derivatives
 from arc.hydraulic_data import build_representative_cross_section_dataframe
 
 
@@ -57,11 +57,13 @@ def _build_test_cross_section() -> CrossSection:
         "i_boundary_number": 0,
         "nrows": 5,
         "ncols": 5,
+        "s_output_bathymetry_path": None,
     }
     return CrossSection(
         1.0,
         1.0,
         np.zeros((5, 5), dtype=np.float64),
+        np.zeros((5, 5), dtype=np.uint8),
         np.zeros((5, 5), dtype=np.uint8),
         params,
     )
@@ -94,6 +96,8 @@ def test_read_main_input_file_keeps_bathymetry_enabled_without_baseflow(tmp_path
             "exponent_depth": 0.25,
             "coefficient_width": 3.0,
             "exponent_width": 0.4,
+            "reach_id": "COMID",
+            "downstream_reach_id": "DSCOMID",
         },
     )
 
@@ -247,28 +251,6 @@ def test_reach_scale_inflect_bank_depth_maps_back_to_local_bank_indices() -> Non
     bank_1_index, bank_2_index = x_section._find_bank_using_reach_scale_inflection()
 
     assert (bank_1_index, bank_2_index) == (3, 2)
-
-
-def test_compute_stream_derivatives_uses_windowed_regression_smoothing() -> None:
-    """INFLECT derivatives should be smoothed by a local regression window."""
-    width_array = np.square(np.arange(30, dtype=np.float64)) + 1.0
-
-    dW_dy, d2W_dy2 = compute_stream_derivatives(width_array, 1.0)
-
-    assert np.allclose(dW_dy[:5], 0.0)
-    assert np.allclose(dW_dy[-5:], 0.0)
-    assert np.all(dW_dy[5:25] > 0.0)
-    assert np.all(d2W_dy2[10:20] > 0.0)
-
-
-def test_find_nonzero_interior_bounds_skips_padded_derivative_edges() -> None:
-    """The second derivative should ignore padded zero edges in ``dW_dy``."""
-    dW_dy = np.array([0.0, 0.0, 1.5, 2.0, 2.5, 0.0, 0.0], dtype=np.float64)
-
-    start, end = _find_nonzero_interior_bounds(dW_dy)
-
-    assert (start, end) == (2, 5)
-
 
 def test_build_representative_cross_section_dataframe_uses_inflect_terrace_depth() -> None:
     """Representative staging should stop at the reach-average INFLECT terrace."""

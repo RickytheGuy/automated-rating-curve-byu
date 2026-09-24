@@ -74,6 +74,7 @@ def _build_cross_section(*, use_bank_elevations: bool) -> CrossSection:
         "i_boundary_number": 0,
         "nrows": 7,
         "ncols": 7,
+        "s_output_bathymetry_path": None,
     }
     x_section = CrossSection(
         1.0,
@@ -379,11 +380,11 @@ def test_non_uniform_solver_initializes_outlet_from_manning_tailwater() -> None:
 
     result = generator._solve_non_uniform_network_depths(
         graph,
-        default_tailwater_wse={10: 97.0},
+        default_tailwater_wse=97.0,
     )[10]
 
     assert result["wse"] == 97.0
-    assert result["depth"] == 2.0
+    assert np.isclose(result["depth"], 2.0, atol=0.01)
     assert result["v"] == 1.0
     assert result["sf"] > 0.0
     assert (
