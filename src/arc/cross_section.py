@@ -2667,25 +2667,6 @@ def _find_bank_using_width_to_depth_ratio(d_bottom_elevation: float, da_xs_profi
 
     return i_bank_1_index, i_bank_2_index
 
-# def multipoint_slope(windowsize, timeseries, xvals):
-#     dw = np.zeros(len(timeseries))
-#     lr_window = int(windowsize/2) # indexing later requires this to be an integer
-#     for n in range(lr_window, len(timeseries) - lr_window):
-#         x = xvals[n - lr_window:n + lr_window]
-#         y = timeseries[n - lr_window:n + lr_window]
-#         # Begin derivative calcs once all width measurements are non-zero
-#         if all(val != 0 for val in y):
-#             # remove nans with a mask, if there are at least two real data points
-#             nancount = sum(1 for x in y if isinstance(x, float) and math.isnan(x))
-#             if nancount > 2:
-#                 mask = ~np.isnan(x) & ~np.isnan(y)
-#                 slope1, intercept1, r_value1, p_value1, std_err1 = linregress(x[mask], np.array(y)[mask])
-#             else: 
-#                 slope1, intercept1, r_value1, p_value1, std_err1 = linregress(x, np.array(y))
-#             dw[n] = slope1
-#         else:
-#             dw[n] = 0 
-#     return dw   
 
 @njit(cache=True)
 def slope_only(x, y):
@@ -2788,27 +2769,6 @@ def compute_stream_derivatives(W, D, dy):
     d2W_dy2 = multipoint_slope(INFLECT_REGRESSION_WINDOW, dW_dy, D, derivative_order=2)
 
     return dW_dy, d2W_dy2
-
-@njit(cache=True)
-def _calculate_inflect_curve(
-    d_bottom_elevation: float,
-    da_xs_profile1: np.ndarray,
-    da_xs_profile2: np.ndarray,
-    xs1_n: int,
-    xs2_n: int,
-    d_ordinate_dist: float,
-) -> np.ndarray:
-    """Return only the INFLECT ``d2W/dy2`` curve for legacy callers."""
-    (_, d2W_dy2) = _calculate_inflect_curve_with_depths(
-        d_bottom_elevation,
-        da_xs_profile1,
-        da_xs_profile2,
-        xs1_n,
-        xs2_n,
-        d_ordinate_dist,
-    )
-    return d2W_dy2
-
 
 @njit(cache=True)
 def _calculate_inflect_curve_with_depths(
