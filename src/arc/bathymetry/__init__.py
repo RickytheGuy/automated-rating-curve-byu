@@ -4,14 +4,22 @@ These are legacy ARC's per-cross-section bathymetry steps (CrossSection's bank s
 the functions they call), for XSection and arc.hydraulics. A cross section goes through them in order:
 
     banks = find_banks(xs, target_width=..., land_cover=..., water_value=...)
+    # ...for every cross section, then along the network (arc.bathymetry.smoothing):
+    smoothed = smooth_bank_elevations(network, reaches, dx, dy)  # each reach's filtered banks and bank elevations
+    # ...then for each cross section, with its banks from smoothed:
     set_bank_distances(xs, banks)                      # for the hydraulics to divide the channel there
     depth = bathymetry_depth(xs, banks, baseflow, slope, trapezoid_height=..., bank_elevation=...)
+    # ...for every cross section, then along the network again (arc.bathymetry.bed_smoothing):
+    channels = smooth_channel_depths(network, reaches, smoothed, depths, dx, dy, use_banks=...)
+    # ...then for each cross section, the k-th of its reach:
     if depth.apply:
-        changed = carve_channel(xs, banks, depth.depth, trapezoid_height=..., bank_elevation=...)
+        changed = carve_channel(xs, banks, channels[reach].depths[k], trapezoid_height=..., bank_elevation=...)
         burn_into_raster(bathymetry, *ordinate_cells(...), xs.elevations, changed)
 
-bank_elevation is None without Bathy_Use_Banks. With it, it is the bank elevation to carve below, which legacy ARC
-smoothed along the reach first.
+bank_elevation is None without Bathy_Use_Banks. With it, it is the cross section's smoothed bank elevation, the level
+to carve below. smooth_bank_elevations filters each reach's widths, which can change its banks, and
+smooth_channel_depths fills in each reach's depths and smooths its bed (with or without legacy's bed cap). The notes
+in their modules list how they differ from legacy ARC.
 
 Banks are distances from the stream cell, not ordinate indices, so a bank can fall between ordinates and a channel's
 top width is the distance between its banks. That is the main way the results differ from legacy ARC. The others
@@ -76,33 +84,30 @@ Numerical differences
 
 Not here yet
 ------------
-- The reach and network steps that run between these, since they work on all of a reach's cross sections together:
-  - smoothing the bank elevations, including the reach width filters and fills
-  - the reach depth and bed smoothing
-  - the network depth solvers
-  - filling gaps in the bathymetry raster
-  The kernels they need for one cross section are here: banks_for_width, single_cell_banks, banks_at_elevation and
-  bank_control_elevation.
+- After carving, filling the gaps in the bathymetry raster (_fill_bathymetry_nan_cells).
 - The INFLECT width-depth curve (_calculate_inflect_curve_with_depths). It feeds the representative cross section's
   terrace depth, and a reach bank depth that no bank search uses. Its moving-window slope takes 10 points, from 5
   before to 4 after, so it is centred half a step off, which is worth checking before porting it.
 - Legacy functions nothing calls weren't ported:
   - _find_bank_inflection_point, get_representative_bank_indices and calc_bankfull_elevation
   - _find_bank_using_reach_scale_inflection and _find_bank_indices_from_elevation (banks_at_elevation does their job)
-  - _estimate_minimum_smoothed_bank_elevation and extract_scalar_hydraulic_geometry
+  - extract_scalar_hydraulic_geometry
 """
 from arc.bathymetry.banks import (Banks, bank_control_elevation, banks_at_elevation, banks_by_flat_water,
                                   banks_by_land_cover, banks_by_width_to_depth_ratio, banks_for_width, find_banks,
                                   in_bank, set_bank_distances, set_in_bank_roughness, single_cell_banks)
+from arc.bathymetry.bed_smoothing import ChannelDepths, fill_reach_depths, smooth_channel_depths, smooth_reach_bed
 from arc.bathymetry.channel import carve_channel
 from arc.bathymetry.depth import (BathymetryDepth, bathymetry_depth, channel_depth, power_law_geometry,
                                   trapezoid_depth, triangle_depth)
 from arc.bathymetry.raster import burn_into_raster, ordinate_cells, sample_land_cover
+from arc.bathymetry.smoothing import ReachSections, ReachWidths, SmoothedReach, reach_network, smooth_bank_elevations
 
 __all__ = [
-    "Banks", "BathymetryDepth", "bank_control_elevation", "banks_at_elevation", "banks_by_flat_water",
-    "banks_by_land_cover", "banks_by_width_to_depth_ratio", "banks_for_width", "bathymetry_depth", "burn_into_raster",
-    "carve_channel", "channel_depth", "find_banks", "in_bank", "ordinate_cells", "power_law_geometry",
-    "sample_land_cover", "set_bank_distances", "set_in_bank_roughness", "single_cell_banks", "trapezoid_depth",
-    "triangle_depth",
+    "Banks", "BathymetryDepth", "ChannelDepths", "ReachSections", "ReachWidths", "SmoothedReach",
+    "bank_control_elevation", "banks_at_elevation", "banks_by_flat_water", "banks_by_land_cover",
+    "banks_by_width_to_depth_ratio", "banks_for_width", "bathymetry_depth", "burn_into_raster", "carve_channel",
+    "channel_depth", "fill_reach_depths", "find_banks", "in_bank", "ordinate_cells", "power_law_geometry",
+    "reach_network", "sample_land_cover", "set_bank_distances", "set_in_bank_roughness", "single_cell_banks",
+    "smooth_bank_elevations", "smooth_channel_depths", "smooth_reach_bed", "trapezoid_depth", "triangle_depth",
 ]
