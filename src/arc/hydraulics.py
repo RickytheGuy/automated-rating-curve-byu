@@ -153,6 +153,31 @@ def conveyance(elevations, mannings_n, spacing, wse):
     return _conveyance(area, weighted_perimeter)
 
 
+@njit(cache=True, error_model="numpy")
+def _side_top_width(elevations, center, step, spacing, wse):
+    """The distance from the centre out to one water edge, given water above the centre (see _side_geometry)."""
+    end = elevations.size - 1 if step > 0 else 0
+    j = center
+    while j != end:
+        z_out = elevations[j + step]
+        if not wse > z_out:
+            z_in = elevations[j]
+            return spacing * (abs(j - center) + (wse - z_in) / (z_out - z_in))
+        j += step
+    return spacing * abs(end - center)  # the water reaches the wall at the end
+
+
+@njit(cache=True, error_model="numpy")
+def top_widths(elevations, spacing, wse):
+    """The water's top width to the left and to the right of the stream cell at a water surface elevation, which
+    are the distances from the stream cell to its edges. Both zero when the water is at or below the stream cell."""
+    center = elevations.size // 2
+    if not wse > elevations[center]:
+        return 0.0, 0.0
+    return (_side_top_width(elevations, center, -1, spacing, wse),
+            _side_top_width(elevations, center, 1, spacing, wse))
+
+
 # The water surface can also be raised from the stream cell one interval at a time, where an interval
 # is a range of water surface elevations (start, end] over which the same ordinates are wet. Within an
 # interval, with u the height above its start, area is quadratic in u and everything else is linear:

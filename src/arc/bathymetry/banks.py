@@ -1,0 +1,352 @@
+"""Finding a cross section's banks, as distances from the stream cell.
+
+Every method gives the distance from the stream cell to each bank, which can fall between ordinates, and the
+channel's top width is the sum of the two. A search tries the methods in legacy ARC's order and keeps the first
+that resolves a channel at least two ordinate spacings wide, unless a drainage-area width prior says the channel is
+a single cell. See the package notes for how this differs from the legacy bank indices.
+"""
+from __future__ import annotations
+
+import math
+from typing import NamedTuple
+
+import numpy as np
+from numba import njit
+
+from arc.hydraulics import top_widths
+from arc.xsection.xsection import XSection
+
+# Sampling gives ordinates off the raster this elevation, which makes them walls (see arc.xsection.sampling)
+OFF_RASTER_ELEVATION = 9999.0
+# Ground less than this far above the stream cell is flat water
+FLAT_WATER_DEPTH = 0.1
+# The width-to-depth search looks no higher than this above the stream cell
+MAX_BANK_HEIGHT = 25.0
+# A width prior no wider than two ordinate spacings makes a single-cell channel, or one spacing from this spacing up
+COARSE_SPACING = 15.0
+
+METHODS = ("none", "single_cell", "land_cover", "width_to_depth_ratio", "flat_water", "target_width", "elevation")
+_NONE, _SINGLE_CELL, _LAND_COVER, _WIDTH_TO_DEPTH, _FLAT_WATER, _TARGET_WIDTH, _ELEVATION = range(7)
+_NO_LAND_COVER = np.empty(0)
+
+
+class Banks(NamedTuple):
+    """Where a cross section's banks are, and how they were found.
+
+    left and right are the distances in metres from the stream cell to the left and right banks (NaN if the method
+    found none), and the elevations are the ground's there. A single-cell channel is too narrow to resolve: its banks
+    are the ordinates either side of the stream cell, and its bathymetry is a triangle between them. valid says the
+    banks can be used: a single-cell channel, or a channel at least two ordinate spacings wide.
+    """
+    method: str
+    left: float
+    right: float
+    left_elevation: float
+    right_elevation: float
+    single_cell: bool
+    valid: bool
+
+    @property
+    def top_width(self) -> float:
+        return self.left + self.right
+
+
+@njit(cache=True, error_model="numpy")
+def _on_raster_ordinates(elevations, center, step):
+    """How many ordinates beyond the stream cell on one side come before the first wall (or NaN)."""
+    end = elevations.size - 1 if step > 0 else 0
+    count = 0
+    j = center
+    while j != end and elevations[j + step] < OFF_RASTER_ELEVATION:
+        count += 1
+        j += step
+    return count
+
+
+@njit(cache=True, error_model="numpy")
+def _ground_at(elevations, center, step, spacing, distance):
+    """The ground's elevation `distance` metres from the stream cell on one side, linear between ordinates."""
+    last = elevations.size - 1 - center if step > 0 else center
+    position = distance / spacing
+    if not position >= 0.0:
+        return np.nan
+    if position >= last:
+        return float(elevations[center + step * last])
+    k = int(position)
+    z = float(elevations[center + step * k])
+    return z + (position - k) * (float(elevations[center + step * (k + 1)]) - z)
+
+
+@njit(cache=True, error_model="numpy")
+def _resolved(left, right, spacing):
+    """Whether banks this far out resolve a channel, which needs to be at least two ordinate spacings wide."""
+    return left >= 0.0 and right >= 0.0 and left + right >= 2.0 * spacing
+
+
+@njit(cache=True, error_model="numpy")
+def _is_single_cell(target_width, spacing, left_ordinates, right_ordinates):
+    if not 0.0 < target_width < np.inf or left_ordinates < 1 or right_ordinates < 1:
+        return False
+    return target_width <= (2.0 if spacing < COARSE_SPACING else 1.0) * spacing
+
+
+@njit(cache=True, error_model="numpy")
+def _side_land_cover_bank(land_cover, center, step, water):
+    """How many ordinate spacings from the stream cell the boundary with the first ordinate that isn't water is, or
+    NaN if the side runs off the raster (NaN land cover) or out of ordinates first."""
+    end = land_cover.size - 1 if step > 0 else 0
+    j = center
+    while j != end:
+        j += step
+        value = land_cover[j]
+        if value == water:
+            continue
+        if math.isnan(value):
+            return np.nan
+        return abs(j - center) - 0.5
+    return np.nan
+
+
+@njit(cache=True, error_model="numpy")
+def _land_cover_banks(land_cover, water, spacing):
+    center = land_cover.size // 2
+    if not land_cover[center] == water:
+        return np.nan, np.nan
+    return (spacing * _side_land_cover_bank(land_cover, center, -1, water),
+            spacing * _side_land_cover_bank(land_cover, center, 1, water))
+
+
+@njit(cache=True, error_model="numpy")
+def _sift_down(heap, i, size):
+    """Restore a binary min-heap below position i."""
+    value = heap[i]
+    while True:
+        child = 2 * i + 1
+        if child >= size:
+            break
+        if child + 1 < size and heap[child + 1] < heap[child]:
+            child += 1
+        if not heap[child] < value:
+            break
+        heap[i] = heap[child]
+        i = child
+    heap[i] = value
+
+
+@njit(cache=True, error_model="numpy")
+def _width_to_depth_banks(elevations, spacing):
+    """The banks at the stage where the ratio of top width to depth stops falling, and that stage's height above the
+    stream cell, or NaNs. The stages tried are the heights of the ordinates above the stream cell, lowest first.
+
+    The search usually stops a few stages up, so the heights come off a heap as needed rather than all being sorted.
+    """
+    center = elevations.size // 2
+    thalweg = float(elevations[center])
+    heap = np.empty(elevations.size)
+    size = 0
+    for j in range(elevations.size):
+        height = float(elevations[j]) - thalweg
+        if 0.0 < height <= MAX_BANK_HEIGHT:
+            heap[size] = height
+            size += 1
+    for i in range(size // 2 - 1, -1, -1):
+        _sift_down(heap, i, size)
+
+    last_left = last_right = last_height = np.nan
+    last_ratio = np.inf
+    while size > 0:
+        height = heap[0]
+        size -= 1
+        heap[0] = heap[size]
+        _sift_down(heap, 0, size)
+        left, right = top_widths(elevations, spacing, thalweg + height)
+        # Legacy ARC rounds to the millimetre, and where the search stops depends on it
+        ratio = np.round((np.round(left, 3) + np.round(right, 3)) / height, 3)
+        if ratio > last_ratio:
+            return last_left, last_right, last_height
+        last_left, last_right, last_height, last_ratio = left, right, height, ratio
+    return np.nan, np.nan, np.nan
+
+
+@njit(cache=True, error_model="numpy")
+def _flat_water_banks(elevations, spacing):
+    return top_widths(elevations, spacing, float(elevations[elevations.size // 2]) + FLAT_WATER_DEPTH)
+
+
+@njit(cache=True, error_model="numpy")
+def _target_width_banks(width, spacing, left_ordinates, right_ordinates):
+    """Half the width on each side, as far as each side reaches, with what one side can't hold on the other."""
+    left_available = left_ordinates * spacing
+    right_available = right_ordinates * spacing
+    left = min(0.5 * width, left_available)
+    right = min(0.5 * width, right_available)
+    remaining = max(width - left - right, 0.0)
+    left_room = left_available - left
+    right_room = right_available - right
+    if remaining > 0.0 and left_room + right_room > 0.0:
+        left = min(left + remaining * left_room / (left_room + right_room), left_available)
+        right = min(right + remaining * right_room / (left_room + right_room), right_available)
+    return left, right
+
+
+@njit(cache=True, error_model="numpy")
+def _search(elevations, spacing, land_cover, water, target_width):
+    """The method find_banks uses, and the distances to the left and right banks."""
+    center = elevations.size // 2
+    if _is_single_cell(target_width, spacing, _on_raster_ordinates(elevations, center, -1),
+                       _on_raster_ordinates(elevations, center, 1)):
+        return _SINGLE_CELL, spacing, spacing
+    if land_cover.size == elevations.size:
+        left, right = _land_cover_banks(land_cover, water, spacing)
+        if _resolved(left, right, spacing):
+            return _LAND_COVER, left, right
+    left, right, _ = _width_to_depth_banks(elevations, spacing)
+    if _resolved(left, right, spacing):
+        return _WIDTH_TO_DEPTH, left, right
+    left, right = _flat_water_banks(elevations, spacing)
+    if _resolved(left, right, spacing):
+        return _FLAT_WATER, left, right
+    return _NONE, np.nan, np.nan
+
+
+@njit(cache=True, error_model="numpy")
+def _with_elevations(elevations, spacing, method, left, right):
+    center = elevations.size // 2
+    return (method, left, right, _ground_at(elevations, center, -1, spacing, left),
+            _ground_at(elevations, center, 1, spacing, right))
+
+
+@njit(cache=True, error_model="numpy")
+def _find_banks(elevations, spacing, land_cover, water, target_width):
+    """find_banks for arrays: the method used, the distances to the left and right banks, and their elevations."""
+    method, left, right = _search(elevations, spacing, land_cover, water, target_width)
+    return _with_elevations(elevations, spacing, method, left, right)
+
+
+def find_banks(xs: XSection, *, target_width: float | None = None, land_cover: np.ndarray | None = None,
+               water_value: float | None = None) -> Banks:
+    """Find a cross section's banks, trying in turn, as legacy ARC did:
+
+    1. A single-cell channel, if a drainage-area width prior (target_width) is no wider than two ordinate spacings,
+       or one for spacings of 15 m or more.
+    2. The land cover, if given (see banks_by_land_cover).
+    3. The stage where the ratio of top width to depth stops falling (see banks_by_width_to_depth_ratio).
+    4. The water's edges 0.1 m above the stream cell (see banks_by_flat_water).
+
+    It keeps the first to resolve a channel at least two ordinate spacings wide. If none does, the banks are not
+    valid, and the bathymetry treats the channel as a single cell.
+    """
+    if land_cover is None:
+        values, water = _NO_LAND_COVER, np.nan
+    else:
+        values, water = _land_cover_values(xs, land_cover, water_value)
+    method, left, right, left_elevation, right_elevation = _find_banks(
+        xs.elevations, float(xs.ordinate_distance), values, water, _optional(target_width))
+    return Banks(METHODS[method], left, right, left_elevation, right_elevation, method == _SINGLE_CELL,
+                 method != _NONE)
+
+
+def banks_by_land_cover(xs: XSection, land_cover: np.ndarray, water_value: float) -> Banks:
+    """Banks where the water in the land cover ends: half way between the last ordinate of water out from the stream
+    cell, which has to be water too, and the first that isn't. No bank on a side whose water runs to the end of the
+    cross section or off the raster (land cover NaN, as sample_land_cover gives)."""
+    values, water = _land_cover_values(xs, land_cover, water_value)
+    left, right = _land_cover_banks(values, water, float(xs.ordinate_distance))
+    return _banks(xs, _LAND_COVER, left, right, _resolved(left, right, xs.ordinate_distance))
+
+
+def banks_by_width_to_depth_ratio(xs: XSection) -> Banks:
+    """Banks at the water's edges at the last stage before the ratio of top width to depth rises.
+
+    The stages tried are the heights of the ordinates above the stream cell, lowest first and up to 25 m. As the
+    water fills the channel the ratio falls, and it rises once the water spills over the banks. No banks if it never
+    rises.
+    """
+    left, right, _ = _width_to_depth_banks(xs.elevations, float(xs.ordinate_distance))
+    return _banks(xs, _WIDTH_TO_DEPTH, left, right, _resolved(left, right, xs.ordinate_distance))
+
+
+def banks_by_flat_water(xs: XSection) -> Banks:
+    """Banks at the water's edges 0.1 m above the stream cell, where the ground stops being flat water."""
+    left, right = _flat_water_banks(xs.elevations, float(xs.ordinate_distance))
+    return _banks(xs, _FLAT_WATER, left, right, _resolved(left, right, xs.ordinate_distance))
+
+
+def banks_at_elevation(xs: XSection, elevation: float) -> Banks:
+    """Banks at the water's edges with the water at an elevation, such as a reach-smoothed bank elevation."""
+    left, right = top_widths(xs.elevations, float(xs.ordinate_distance), float(elevation))
+    return _banks(xs, _ELEVATION, left, right, _resolved(left, right, xs.ordinate_distance))
+
+
+def banks_for_width(xs: XSection, width: float) -> Banks:
+    """Banks that make a channel a given width, such as a reach's median width.
+
+    A width of one ordinate spacing or less is a single-cell channel. Otherwise half the width goes on each side, as
+    far as that side stays on the raster, with what one side can't hold on the other.
+    """
+    spacing = float(xs.ordinate_distance)
+    center = xs.elevations.size // 2
+    left_ordinates = _on_raster_ordinates(xs.elevations, center, -1)
+    right_ordinates = _on_raster_ordinates(xs.elevations, center, 1)
+    width = _optional(width)
+    if not 0.0 < width < np.inf or left_ordinates < 1 or right_ordinates < 1:
+        return _banks(xs, _TARGET_WIDTH, np.nan, np.nan, False)
+    if width <= spacing:
+        return single_cell_banks(xs)
+    left, right = _target_width_banks(width, spacing, left_ordinates, right_ordinates)
+    return _banks(xs, _TARGET_WIDTH, left, right, _resolved(left, right, spacing))
+
+
+def single_cell_banks(xs: XSection) -> Banks:
+    """The banks of a single-cell channel: the ordinates either side of the stream cell, if they're on the raster."""
+    spacing = float(xs.ordinate_distance)
+    center = xs.elevations.size // 2
+    valid = _on_raster_ordinates(xs.elevations, center, -1) >= 1 and _on_raster_ordinates(xs.elevations, center, 1) >= 1
+    return _banks(xs, _SINGLE_CELL, spacing, spacing, valid)
+
+
+def set_bank_distances(xs: XSection, banks: Banks) -> None:
+    """Store valid banks on the cross section, for the hydraulics to divide it there. Otherwise -1, for none."""
+    xs.left_bank_distance = float(banks.left) if banks.valid else -1.0
+    xs.right_bank_distance = float(banks.right) if banks.valid else -1.0
+
+
+def bank_control_elevation(banks: Banks, thalweg: float) -> float:
+    """The lower of the two bank elevations above the stream cell, the first level at which water can leave the
+    channel, or NaN if neither is above it."""
+    above = [elevation for elevation in (banks.left_elevation, banks.right_elevation) if elevation > thalweg]
+    return min(above) if above else math.nan
+
+
+def in_bank(xs: XSection, banks: Banks) -> np.ndarray:
+    """Which ordinates are between valid banks, the banks included. None are for banks that aren't valid."""
+    n = xs.elevations.size
+    offsets = (np.arange(n) - n // 2) * float(xs.ordinate_distance)
+    if not banks.valid:
+        return np.zeros(n, dtype=bool)
+    tolerance = 1e-9 * float(xs.ordinate_distance)
+    return (offsets >= -banks.left - tolerance) & (offsets <= banks.right + tolerance)
+
+
+def set_in_bank_roughness(xs: XSection, banks: Banks, mannings_n: float) -> None:
+    """Give the ordinates between valid banks (see in_bank) the water's Manning's n."""
+    xs.mannings_n[in_bank(xs, banks)] = mannings_n
+
+
+def _banks(xs: XSection, method: int, left: float, right: float, valid: bool) -> Banks:
+    _, left, right, left_elevation, right_elevation = _with_elevations(
+        xs.elevations, float(xs.ordinate_distance), method, float(left), float(right))
+    return Banks(METHODS[method], left, right, left_elevation, right_elevation, method == _SINGLE_CELL, bool(valid))
+
+
+def _land_cover_values(xs: XSection, land_cover: np.ndarray, water_value: float | None) -> tuple[np.ndarray, float]:
+    if water_value is None:
+        raise TypeError("Give the land cover's water value with the land cover.")
+    values = np.asarray(land_cover, dtype=np.float64)
+    if values.shape != xs.elevations.shape:
+        raise ValueError(f"The land cover has shape {values.shape}, but the cross section has {xs.elevations.shape}.")
+    return values, float(water_value)
+
+
+def _optional(value: float | None) -> float:
+    return math.nan if value is None else float(value)

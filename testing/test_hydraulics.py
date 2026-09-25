@@ -215,6 +215,25 @@ def test_off_raster_walls_hold_the_water_in() -> None:
     assert geometry.mannings_n == pytest.approx(N, rel=1e-12)  # the walls' 9999 roughness doesn't count
 
 
+@pytest.mark.parametrize("shape", SHAPES)
+def test_top_widths_are_each_side_s_share_of_the_top_width(shape: str) -> None:
+    """The distances from the stream cell to the water's edges, which add up to the top width."""
+    xs = SHAPES[shape]()
+    ground = xs.elevations[xs.elevations < 9000]
+    center = xs.elevations.size // 2
+
+    for wse in np.concatenate([np.linspace(ground.min() - 1, ground.max() + 3, 200), ground]):
+        left, right = hydraulics.top_widths(xs.elevations, xs.ordinate_distance, wse)
+        if not wse > xs.elevations[center]:
+            assert (left, right) == (0.0, 0.0)
+            continue
+        assert left == pytest.approx(hydraulics._side_geometry(
+            xs.elevations, xs.mannings_n, center, -1, xs.ordinate_distance, wse)[2], rel=1e-12)
+        assert right == pytest.approx(hydraulics._side_geometry(
+            xs.elevations, xs.mannings_n, center, 1, xs.ordinate_distance, wse)[2], rel=1e-12)
+        assert left + right == pytest.approx(hydraulic_geometry(xs, wse=wse).top_width, rel=1e-12)
+
+
 def test_mirroring_the_section_changes_nothing() -> None:
     xs = rough_valley()
     mirrored = XSection(xs.elevations[::-1].copy(), xs.mannings_n[::-1].copy(), xs.ordinate_distance)
