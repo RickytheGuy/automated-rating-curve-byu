@@ -8,11 +8,12 @@ import pytest
 from numba import njit
 
 from arc import bathymetry, hydraulics
+from arc.Automated_Rating_Curve_Generator import _fill_bathymetry_nan_cells
 from arc.bathymetry import (Banks, bank_control_elevation, banks_at_elevation, banks_by_flat_water,
                             banks_by_land_cover, banks_by_width_to_depth_ratio, banks_for_width, bathymetry_depth,
-                            burn_into_raster, carve_channel, channel_depth, find_banks, in_bank, ordinate_cells,
-                            power_law_geometry, sample_land_cover, set_bank_distances, set_in_bank_roughness,
-                            single_cell_banks, trapezoid_depth, triangle_depth)
+                            burn_into_raster, carve_channel, channel_depth, fill_bathymetry_gaps, find_banks, in_bank,
+                            ordinate_cells, power_law_geometry, sample_land_cover, set_bank_distances,
+                            set_in_bank_roughness, single_cell_banks, trapezoid_depth, triangle_depth)
 from arc.bathymetry import banks as banks_module
 from arc.bathymetry import channel as channel_module
 from arc.cross_section import (CrossSection, _adjust_one_side_for_bathymetry, _find_bank_using_width_to_depth_ratio,
@@ -641,6 +642,87 @@ def test_the_raster_takes_the_first_value_then_averages() -> None:
     assert np.isnan(raster[1]).all()  # the ordinate off the raster was skipped
 
 
+def test_a_gap_with_bathymetry_in_four_of_the_cells_around_it_gets_their_mean() -> None:
+    """The middle cell has bathymetry in four of the eight cells around it, and without the last of them, three. The
+    others, next to the raster's edge, have at most three, since beyond the edge counts as no bathymetry."""
+    raster = np.full((3, 3), np.nan)
+    raster[0, 0], raster[0, 2], raster[2, 0], raster[2, 1] = 1.0, 2.0, 3.0, 6.0
+    three = raster.copy()
+    three[2, 1] = np.nan
+
+    assert fill_bathymetry_gaps(raster) is raster
+    assert raster[1, 1] == 3.0
+    assert np.isnan(raster).sum() == 4
+    assert np.isnan(fill_bathymetry_gaps(three)).sum() == 6
+
+
+def test_every_gap_is_filled_from_the_raster_as_it_was() -> None:
+    """The gap at (1, 1) has four neighbours with bathymetry, and the one at (1, 2) three, so it stays a gap even
+    though filling (1, 1) gives it a fourth. Given a fourth of its own at (0, 2), it gets the mean of its four, leaving
+    out (1, 1)'s fill."""
+    raster = np.full((3, 4), np.nan)
+    raster[0, 0], raster[0, 1], raster[1, 0], raster[2, 0] = 1.0, 2.0, 3.0, 6.0
+    raster[1, 3], raster[2, 3] = 5.0, 5.0
+    fourth = raster.copy()
+    fourth[0, 2] = 8.0
+
+    fill_bathymetry_gaps(raster)
+    fill_bathymetry_gaps(fourth)
+
+    assert raster[1, 1] == 3.0
+    assert np.isnan(raster[1, 2])
+    assert fourth[1, 1] == 4.0
+    assert fourth[1, 2] == 5.0
+
+
+def test_the_gap_fill_matches_legacy_s() -> None:
+    """Random rasters, float32 and float64, from nearly empty to nearly full."""
+    rng = np.random.default_rng(2)
+    for trial in range(300):
+        shape = tuple(int(s) for s in rng.integers(1, 30, 2))
+        raster = rng.normal(95.0, 2.0, shape)
+        raster[rng.random(shape) < rng.uniform(0.0, 1.0)] = np.nan
+        if trial % 2 == 0:
+            raster = raster.astype(np.float32)
+
+        expected = _fill_bathymetry_nan_cells(raster.copy())
+
+        np.testing.assert_array_equal(fill_bathymetry_gaps(raster), expected)
+        assert raster.dtype == expected.dtype
+
+
+def test_without_bank_elevations_no_gap_is_filled_above_the_ground() -> None:
+    """A channel carved to 95 m through ground at 100 m, with a pool at 94 m that it wasn't carved into, and one cell
+    whose bathymetry is above the ground. That cell is dropped and filled again from its neighbours, as legacy did,
+    but where legacy then filled the pool to 95 m, above its ground, here it stays a gap. Bathymetry level with the
+    ground stays, and so does a fill level with it."""
+    ground = np.full((7, 9), 100.0, dtype=np.float32)
+    ground[3, 4] = 94.0
+    ground[3, 2] = ground[2, 3] = 95.0
+    raster = np.full((7, 9), np.nan, dtype=np.float32)
+    raster[2:5, 1:8] = 95.0
+    raster[3, 4] = raster[3, 2] = np.nan
+    raster[2, 6] = 100.5
+
+    expected = _fill_bathymetry_nan_cells(np.where(raster > ground, np.nan, raster).astype(np.float32))
+    fill_bathymetry_gaps(raster, ground)
+
+    assert expected[3, 4] == 95.0
+    assert np.isnan(raster[3, 4])
+    assert raster[2, 6] == raster[3, 2] == raster[2, 3] == 95.0
+    expected[3, 4] = np.nan
+    np.testing.assert_array_equal(raster, expected)
+
+
+def test_the_gap_fill_needs_a_2d_floating_raster_and_ground_like_it() -> None:
+    with pytest.raises(ValueError, match="2-D"):
+        fill_bathymetry_gaps(np.full(4, np.nan))
+    with pytest.raises(TypeError, match="floating"):
+        fill_bathymetry_gaps(np.zeros((2, 2), dtype=np.int32))
+    with pytest.raises(ValueError, match="ground"):
+        fill_bathymetry_gaps(np.full((2, 2), np.nan), np.zeros((2, 3)))
+
+
 # --- Speed (each compiled loop runs once first, so compilation isn't counted) --------------------------------------
 
 # Compiled but not cached: a cache wouldn't pick up changes to the functions these call in other modules.
@@ -786,3 +868,17 @@ def test_a_cross_section_s_whole_bathymetry_is_faster_than_legacy_s() -> None:
         legacy.Calculate_Bathymetry_Based_on_WSE_or_LC(legacy_raster, bank_search_result=result)
 
     assert _seconds_per_python_call(new, calls=1000) < _seconds_per_python_call(old, calls=300)
+
+
+def test_the_gap_fill_is_faster_than_legacy_s() -> None:
+    """A 2000 x 2000 raster, empty but for channels three cells wide every 50 columns, with 2% of their cells gaps."""
+    rng = np.random.default_rng(0)
+    raster = np.full((2000, 2000), np.nan, dtype=np.float32)
+    for first in range(10, 2000, 50):
+        raster[:, first:first + 3] = 95.0
+    raster[rng.random(raster.shape) < 0.02] = np.nan
+
+    new = _seconds_per_python_call(lambda: fill_bathymetry_gaps(raster.copy()), calls=3)
+    old = _seconds_per_python_call(lambda: _fill_bathymetry_nan_cells(raster.copy()), calls=3)
+
+    assert new < old
