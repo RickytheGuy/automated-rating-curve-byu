@@ -9,7 +9,9 @@ section act as vertical walls, like the off-raster walls from sampling.
 Discharge uses Manning's equation in SI units. Each segment of wetted ground takes the Manning's n of
 its end nearer the centre, so wall ordinates never contribute their own n. The section's roughness is
 the Horton-Einstein composite n = (sum(P_i * n_i**1.5) / P) ** (2/3), which makes the conveyance
-K = A**(5/3) / sum(P_i * n_i**1.5) ** (2/3) and the discharge Q = K * sqrt(slope).
+K = A**(5/3) / sum(P_i * n_i**1.5) ** (2/3) and the discharge Q = K * sqrt(slope). Legacy ARC's two adjustments are
+here too: its depth-varying roughness (DepthRoughness), which scales each n by the depth of the water over it, and
+its slope_adjustment_factor (slope_factor), which multiplies sqrt(slope) and so the discharge.
 
 A cross section with banks is divided at them into a left overbank, the channel and a right overbank,
 and its conveyance is the sum of theirs (the divided channel method; see the notes above
@@ -17,7 +19,8 @@ compound_wetted_geometry). The banks don't change where the water is, only how i
 
 The functions taking arrays are compiled with numba, so they can be called from other compiled code
 in ARC's per-cell loop. The functions taking an XSection are conveniences on top of them, and use the
-XSection's banks if it has any.
+XSection's banks if it has any, and its carved channel's exact profile if it has one (see the notes above
+uniform_profile).
 """
 from __future__ import annotations
 
@@ -27,7 +30,7 @@ from typing import NamedTuple
 import numpy as np
 from numba import njit
 
-from arc.xsection.xsection import XSection
+from arc.xsection.xsection import Profile, XSection
 
 
 class HydraulicGeometry(NamedTuple):
@@ -927,45 +930,562 @@ def compound_table_wse_for_conveyance(table, target):
     return _compound_wse_in_interval(table[row], target)
 
 
-def hydraulic_geometry(xs: XSection, *, wse: float | None = None, depth: float | None = None) -> HydraulicGeometry:
+# --- Depth-varying roughness ---------------------------------------------------------------------------------------
+# Legacy ARC scales each ordinate's Manning's n by the depth of the water over it (k_decay, shallow_factor and
+# deep_factor, legacy _adjust_n_by_depth):
+#
+#     n(h) = n0 * (deep_factor + (shallow_factor - deep_factor) / (1 + k_decay * h)),   h = max(wse - z, 0)
+#
+# So at the water's edge the ground is shallow_factor times rougher than n0, and the roughness falls towards
+# deep_factor times n0 as the water deepens. Both factors 1 leave n0 as it is. Each segment of wetted ground still
+# takes the n of its end nearer the centre, now scaled by the depth over that end, and an end wall takes its
+# ordinate's, scaled by the depth there. The bank-divided sections use the same n.
+#
+# The scaled n changes with the water surface, so conveyance is no longer linear in it within an interval as a
+# conveyance table needs. These functions integrate the water afresh at each water surface elevation instead, and
+# wse_for_depth_varying_conveyance steps through the intervals and solves within the one where the conveyance
+# reaches its target.
+#
+# Legacy took the n and the depth at a fully wet segment's outer end, and at the inner end of a segment where the
+# water meets the ground, as here. The two agree for uniform n0 wherever the wetted ground between ordinates is level.
+
+
+class DepthRoughness(NamedTuple):
+    """Legacy ARC's depth-varying Manning's n parameters (see the notes above). The defaults are legacy's."""
+    k_decay: float = 6.0  # per metre of depth
+    shallow_factor: float = 2.0  # at least 1
+    deep_factor: float = 1.0  # above 0, at most 1
+
+    def scale(self, n0, depth):
+        """n0 scaled for water depth deep over it (legacy _adjust_n_by_depth); depths below 0 count as 0."""
+        _check_roughness(self)
+        h = np.maximum(depth, 0.0)
+        return n0 * (self.deep_factor + (self.shallow_factor - self.deep_factor) / (1.0 + self.k_decay * h))
+
+
+@njit(cache=True, error_model="numpy")
+def _scaled_n_15(n0, depth, k_decay, shallow_factor, deep_factor):
+    """(n0 scaled for water depth deep over it) ** 1.5, with the scaling as legacy _adjust_n_by_depth writes it."""
+    n = n0 * (deep_factor + (shallow_factor - deep_factor) / (1.0 + k_decay * max(depth, 0.0)))
+    return n * math.sqrt(n)
+
+
+@njit(cache=True, error_model="numpy")
+def _depth_varying_side(elevations, n0, center, step, spacing, wse, bank, extent, k_decay, shallow_factor,
+                        deep_factor):
+    """_divided_side_geometry with depth-varying roughness: the area, wetted perimeter, top width and
+    sum(P_i * n_i**1.5) of the part of one side in the channel, then of the part in the overbank.
+
+    The water covers every ordinate from the centre out to ordinate `extent`, then meets the ground part way along the
+    next segment, or the wall if `extent` is the end. A negative extent walks out from the centre to the first
+    ordinate at or above wse, as _side_geometry does.
+    """
+    end = elevations.size - 1 if step > 0 else 0
+    if extent < 0:
+        extent = center
+        while extent != end and wse > elevations[extent + step]:
+            extent += step
+    bank_segment, bank_fraction = _bank_position(bank, spacing, abs(end - center))
+    channel_area = channel_perimeter = channel_top_width = channel_weighted = 0.0
+    overbank_area = overbank_perimeter = overbank_top_width = overbank_weighted = 0.0
+    segment = 0
+    j = center
+    while True:
+        if j == end:
+            # The water reaches the wall at the end, in the overbank if the bank is inside the section
+            depth_end = wse - elevations[end]
+            n_15 = _scaled_n_15(n0[end], depth_end, k_decay, shallow_factor, deep_factor)
+            if segment > bank_segment:
+                overbank_perimeter += depth_end
+                overbank_weighted += depth_end * n_15
+            else:
+                channel_perimeter += depth_end
+                channel_weighted += depth_end * n_15
+            break
+        z_in = elevations[j]
+        z_out = elevations[j + step]
+        rise = z_out - z_in
+        depth_in = wse - z_in
+        full = j != extent
+        if full:
+            wet = 1.0  # the fraction of the segment under water
+            depth_out = wse - z_out
+        else:
+            wet = depth_in / rise  # the water meets the ground part way along the segment
+            depth_out = 0.0
+        length = _length(spacing, rise)
+        n_15 = _scaled_n_15(n0[j], depth_in, k_decay, shallow_factor, deep_factor)
+
+        if segment < bank_segment or (segment == bank_segment and wet <= bank_fraction):
+            channel_area += spacing * wet * (depth_in + depth_out) / 2
+            channel_perimeter += wet * length
+            channel_weighted += wet * length * n_15
+            channel_top_width += spacing * wet
+        elif segment > bank_segment or bank_fraction == 0.0:
+            overbank_area += spacing * wet * (depth_in + depth_out) / 2
+            overbank_perimeter += wet * length
+            overbank_weighted += wet * length * n_15
+            overbank_top_width += spacing * wet
+        else:
+            # The bank divides the wet part of the segment
+            depth_bank = depth_in - bank_fraction * rise
+            outer = wet - bank_fraction
+            channel_area += spacing * bank_fraction * (depth_in + depth_bank) / 2
+            channel_perimeter += bank_fraction * length
+            channel_weighted += bank_fraction * length * n_15
+            channel_top_width += spacing * bank_fraction
+            overbank_area += spacing * outer * (depth_bank + depth_out) / 2
+            overbank_perimeter += outer * length
+            overbank_weighted += outer * length * n_15
+            overbank_top_width += spacing * outer
+
+        if not full:
+            break
+        j += step
+        segment += 1
+    return (channel_area, channel_perimeter, channel_top_width, channel_weighted,
+            overbank_area, overbank_perimeter, overbank_top_width, overbank_weighted)
+
+
+@njit(cache=True, error_model="numpy")
+def _depth_varying_parts(elevations, n0, spacing, left_bank, right_bank, wse, left, right, k_decay, shallow_factor,
+                         deep_factor):
+    center = elevations.size // 2
+    lo = _depth_varying_side(elevations, n0, center, -1, spacing, wse, left_bank, left, k_decay, shallow_factor,
+                             deep_factor)
+    hi = _depth_varying_side(elevations, n0, center, 1, spacing, wse, right_bank, right, k_decay, shallow_factor,
+                             deep_factor)
+    channel = (lo[0] + hi[0], lo[1] + hi[1], lo[2] + hi[2], lo[3] + hi[3])
+    return (lo[4], lo[5], lo[6], lo[7]), channel, (hi[4], hi[5], hi[6], hi[7])
+
+
+@njit(cache=True, error_model="numpy")
+def depth_varying_compound_geometry(elevations, mannings_n, spacing, left_bank, right_bank, wse, k_decay,
+                                    shallow_factor, deep_factor):
+    """compound_wetted_geometry with depth-varying roughness (see the notes above): the left overbank's, the
+    channel's and the right overbank's area, wetted perimeter, top width and sum(P_i * n_i**1.5). Banks that are
+    negative or NaN put everything in the channel."""
+    center = elevations.size // 2
+    if not wse > elevations[center]:
+        dry = (0.0, 0.0, 0.0, 0.0)
+        return dry, dry, dry
+    return _depth_varying_parts(elevations, mannings_n, spacing, left_bank, right_bank, wse, -1, -1, k_decay,
+                                shallow_factor, deep_factor)
+
+
+@njit(cache=True, error_model="numpy")
+def depth_varying_geometry(elevations, mannings_n, spacing, wse, k_decay, shallow_factor, deep_factor):
+    """wetted_geometry with depth-varying roughness: area, wetted perimeter, top width and sum(P_i * n_i**1.5)."""
+    return depth_varying_compound_geometry(elevations, mannings_n, spacing, -1.0, -1.0, wse, k_decay, shallow_factor,
+                                           deep_factor)[1]
+
+
+@njit(cache=True, error_model="numpy")
+def _parts_conveyance(parts):
+    left, channel, right = parts
+    return _conveyance(left[0], left[3]) + _conveyance(channel[0], channel[3]) + _conveyance(right[0], right[3])
+
+
+@njit(cache=True, error_model="numpy")
+def depth_varying_conveyance(elevations, mannings_n, spacing, left_bank, right_bank, wse, k_decay, shallow_factor,
+                             deep_factor):
+    """Conveyance with depth-varying roughness: the sum of the subsections' conveyances, divided at the banks (or
+    not, for banks that are negative or NaN)."""
+    return _parts_conveyance(depth_varying_compound_geometry(elevations, mannings_n, spacing, left_bank, right_bank,
+                                                             wse, k_decay, shallow_factor, deep_factor))
+
+
+@njit(cache=True, error_model="numpy")
+def _interval_conveyance(elevations, n0, spacing, left_bank, right_bank, wse, left, right, k_decay, shallow_factor,
+                         deep_factor):
+    return _parts_conveyance(_depth_varying_parts(elevations, n0, spacing, left_bank, right_bank, wse, left, right,
+                                                  k_decay, shallow_factor, deep_factor))
+
+
+@njit(cache=True, error_model="numpy")
+def _solve_interval(elevations, n0, spacing, left_bank, right_bank, left, right, k_decay, shallow_factor, deep_factor,
+                    lo, hi, k_lo, k_hi, target):
+    """The water surface elevation between lo and hi where the interval's conveyance reaches target, given that it
+    is below target at lo and not below it at hi. Regula falsi on the conveyance, with the Illinois method's halving
+    to keep it moving, bisecting whenever that would leave the bracket."""
+    f_lo, f_hi = k_lo - target, k_hi - target
+    side = 0
+    for _ in range(200):
+        if hi - lo <= 1e-12 * (1.0 + abs(hi)):
+            break
+        u = hi - f_hi * (hi - lo) / (f_hi - f_lo)
+        if not lo < u < hi:
+            u = 0.5 * (lo + hi)
+        f = _interval_conveyance(elevations, n0, spacing, left_bank, right_bank, u, left, right, k_decay,
+                                 shallow_factor, deep_factor) - target
+        if f == 0.0:
+            return u
+        if f > 0.0:
+            hi, f_hi = u, f
+            if side == 1:
+                f_lo *= 0.5
+            side = 1
+        else:
+            lo, f_lo = u, f
+            if side == -1:
+                f_hi *= 0.5
+            side = -1
+    return hi
+
+
+@njit(cache=True, error_model="numpy")
+def wse_for_depth_varying_conveyance(elevations, mannings_n, spacing, left_bank, right_bank, target, k_decay,
+                                     shallow_factor, deep_factor, max_wse=np.inf):
+    """The lowest water surface elevation whose conveyance with depth-varying roughness reaches target, divided at
+    the banks (or not, for banks that are negative or NaN), as wse_for_conveyance does without the scaling.
+
+    It raises the water surface one interval at a time, from the stream cell to the next ordinate on either side
+    that stops the water, and solves within the first interval whose conveyance reaches the target. Where conveyance
+    jumps past the target (water spilling over a high point into low ground beyond it), this returns the elevation
+    of that high point. NaN if the target isn't reached at or below max_wse, or ever.
+    """
+    n = elevations.size
+    center = n // 2
+    level = float(elevations[center])
+    if target <= 0.0:
+        return level
+    left = right = center
+    while True:
+        # Once the water is above this level, each side's edge moves past any ground no higher than it
+        while right < n - 1 and elevations[right + 1] <= level:
+            right += 1
+        while left > 0 and elevations[left - 1] <= level:
+            left -= 1
+        if level > max_wse:
+            return np.nan
+        k_start = _interval_conveyance(elevations, mannings_n, spacing, left_bank, right_bank, level, left, right,
+                                       k_decay, shallow_factor, deep_factor)
+        if k_start >= target:
+            return level
+        next_right = elevations[right + 1] if right < n - 1 else np.inf
+        next_left = elevations[left - 1] if left > 0 else np.inf
+        end = min(next_right, next_left)
+        if end == np.inf:
+            # Both sides are at their walls, and conveyance grows without bound with the depth
+            height = 1.0
+            top = level + height
+            k_top = _interval_conveyance(elevations, mannings_n, spacing, left_bank, right_bank, top, left, right,
+                                         k_decay, shallow_factor, deep_factor)
+            if not k_top > k_start:
+                return np.nan  # no width between the walls, so this section never carries any water
+            while k_top < target and top < max_wse:
+                height *= 2.0
+                top = level + height
+                k_top = _interval_conveyance(elevations, mannings_n, spacing, left_bank, right_bank, top, left, right,
+                                             k_decay, shallow_factor, deep_factor)
+        else:
+            top = end
+            k_top = _interval_conveyance(elevations, mannings_n, spacing, left_bank, right_bank, top, left, right,
+                                         k_decay, shallow_factor, deep_factor)
+        if k_top >= target:
+            answer = _solve_interval(elevations, mannings_n, spacing, left_bank, right_bank, left, right, k_decay,
+                                     shallow_factor, deep_factor, level, top, k_start, k_top, target)
+            return answer if answer <= max_wse else np.nan
+        if end == np.inf or end > max_wse:
+            return np.nan
+        level = end
+
+
+# --- Profiles -----------------------------------------------------------------------------------------------------
+# A Profile (arc.xsection.xsection) is a cross section's ground as a polyline whose vertices needn't be a spacing
+# apart, as where a carved channel's corners fall between the ordinates. Its hydraulics are the ordinates' (see the
+# notes at the top), with each segment its own width, and with the depth-varying roughness above (shallow_factor and
+# deep_factor of 1 leave n as it is). Two vertices at the same distance are a vertical face, which adds its wetted
+# height to the wetted perimeter and nothing to the area or the top width. A face at a bank is in the channel if it
+# rises outward from the channel, and in the overbank if it falls, since that is the side whose water it holds. The
+# rating curves use these for every cross section, the ordinates being a profile a spacing apart.
+
+
+def uniform_profile(elevations: np.ndarray, mannings_n: np.ndarray, spacing: float) -> Profile:
+    """The profile of ordinates a spacing apart, with the stream cell in the middle."""
+    center = elevations.size // 2
+    return Profile((np.arange(elevations.size) - center) * float(spacing), elevations, mannings_n, center)
+
+
+def hydraulic_profile(xs: XSection) -> Profile:
+    """The ground the hydraulics use: the carved channel's exact profile if the cross section has one, and otherwise
+    its ordinates."""
+    if xs.profile is not None:
+        return xs.profile
+    return uniform_profile(xs.elevations, xs.mannings_n, xs.ordinate_distance)
+
+
+@njit(cache=True, error_model="numpy")
+def _profile_side(stations, elevations, n0, center, step, wse, bank, extent, k_decay, shallow_factor, deep_factor):
+    """_depth_varying_side on a profile: the area, wetted perimeter, top width and sum(P_i * n_i**1.5) of the part
+    of one side in the channel, then of the part in the overbank. A bank that is negative or NaN, or at or beyond
+    the side's last vertex, leaves the side all channel."""
+    end = elevations.size - 1 if step > 0 else 0
+    if extent < 0:
+        extent = center
+        while extent != end and wse > elevations[extent + step]:
+            extent += step
+    origin = stations[center]
+    divided = bank >= 0.0 and bank < abs(stations[end] - origin)
+    channel_area = channel_perimeter = channel_top_width = channel_weighted = 0.0
+    overbank_area = overbank_perimeter = overbank_top_width = overbank_weighted = 0.0
+    j = center
+    while True:
+        if j == end:
+            # The water reaches the wall at the end, in the overbank if the bank is inside the section
+            depth_end = wse - elevations[end]
+            n_15 = _scaled_n_15(n0[end], depth_end, k_decay, shallow_factor, deep_factor)
+            if divided:
+                overbank_perimeter += depth_end
+                overbank_weighted += depth_end * n_15
+            else:
+                channel_perimeter += depth_end
+                channel_weighted += depth_end * n_15
+            break
+        z_in = elevations[j]
+        z_out = elevations[j + step]
+        d_in = abs(stations[j] - origin)
+        d_out = abs(stations[j + step] - origin)
+        width = d_out - d_in
+        rise = z_out - z_in
+        depth_in = wse - z_in
+        full = j != extent
+        if full:
+            wet = 1.0  # the fraction of the segment under water
+            depth_out = wse - z_out
+        else:
+            wet = depth_in / rise  # the water meets the ground part way along the segment
+            depth_out = 0.0
+        length = math.sqrt(width * width + rise * rise)
+        n_15 = _scaled_n_15(n0[j], depth_in, k_decay, shallow_factor, deep_factor)
+
+        if not divided or d_out < bank or (d_out == bank and (width > 0.0 or rise > 0.0)):
+            in_channel = wet
+        elif d_in >= bank:
+            in_channel = 0.0
+        else:
+            in_channel = min(wet, (bank - d_in) / width)  # the bank divides the segment
+        if in_channel == wet:
+            channel_area += width * wet * (depth_in + depth_out) / 2
+            channel_perimeter += wet * length
+            channel_weighted += wet * length * n_15
+            channel_top_width += width * wet
+        elif in_channel == 0.0:
+            overbank_area += width * wet * (depth_in + depth_out) / 2
+            overbank_perimeter += wet * length
+            overbank_weighted += wet * length * n_15
+            overbank_top_width += width * wet
+        else:
+            depth_bank = depth_in - in_channel * rise
+            outer = wet - in_channel
+            channel_area += width * in_channel * (depth_in + depth_bank) / 2
+            channel_perimeter += in_channel * length
+            channel_weighted += in_channel * length * n_15
+            channel_top_width += width * in_channel
+            overbank_area += width * outer * (depth_bank + depth_out) / 2
+            overbank_perimeter += outer * length
+            overbank_weighted += outer * length * n_15
+            overbank_top_width += width * outer
+
+        if not full:
+            break
+        j += step
+    return (channel_area, channel_perimeter, channel_top_width, channel_weighted,
+            overbank_area, overbank_perimeter, overbank_top_width, overbank_weighted)
+
+
+@njit(cache=True, error_model="numpy")
+def _profile_parts(stations, elevations, n0, center, left_bank, right_bank, wse, left, right, k_decay, shallow_factor,
+                   deep_factor):
+    lo = _profile_side(stations, elevations, n0, center, -1, wse, left_bank, left, k_decay, shallow_factor,
+                       deep_factor)
+    hi = _profile_side(stations, elevations, n0, center, 1, wse, right_bank, right, k_decay, shallow_factor,
+                       deep_factor)
+    channel = (lo[0] + hi[0], lo[1] + hi[1], lo[2] + hi[2], lo[3] + hi[3])
+    return (lo[4], lo[5], lo[6], lo[7]), channel, (hi[4], hi[5], hi[6], hi[7])
+
+
+@njit(cache=True, error_model="numpy")
+def profile_compound_geometry(stations, elevations, mannings_n, center, left_bank, right_bank, wse, k_decay,
+                              shallow_factor, deep_factor):
+    """depth_varying_compound_geometry on a profile (see the notes above): the left overbank's, the channel's and
+    the right overbank's area, wetted perimeter, top width and sum(P_i * n_i**1.5). Banks that are negative or NaN
+    put everything in the channel."""
+    if not wse > elevations[center]:
+        dry = (0.0, 0.0, 0.0, 0.0)
+        return dry, dry, dry
+    return _profile_parts(stations, elevations, mannings_n, center, left_bank, right_bank, wse, -1, -1, k_decay,
+                          shallow_factor, deep_factor)
+
+
+@njit(cache=True, error_model="numpy")
+def profile_conveyance(stations, elevations, mannings_n, center, left_bank, right_bank, wse, k_decay, shallow_factor,
+                       deep_factor):
+    """A profile's conveyance: the sum of its subsections', divided at the banks (or not, for banks that are
+    negative or NaN)."""
+    return _parts_conveyance(profile_compound_geometry(stations, elevations, mannings_n, center, left_bank, right_bank,
+                                                       wse, k_decay, shallow_factor, deep_factor))
+
+
+@njit(cache=True, error_model="numpy")
+def _profile_interval_conveyance(stations, elevations, n0, center, left_bank, right_bank, wse, left, right, k_decay,
+                                 shallow_factor, deep_factor):
+    return _parts_conveyance(_profile_parts(stations, elevations, n0, center, left_bank, right_bank, wse, left, right,
+                                            k_decay, shallow_factor, deep_factor))
+
+
+@njit(cache=True, error_model="numpy")
+def _profile_solve_interval(stations, elevations, n0, center, left_bank, right_bank, left, right, k_decay,
+                            shallow_factor, deep_factor, lo, hi, k_lo, k_hi, target):
+    """_solve_interval on a profile."""
+    f_lo, f_hi = k_lo - target, k_hi - target
+    side = 0
+    for _ in range(200):
+        if hi - lo <= 1e-12 * (1.0 + abs(hi)):
+            break
+        u = hi - f_hi * (hi - lo) / (f_hi - f_lo)
+        if not lo < u < hi:
+            u = 0.5 * (lo + hi)
+        f = _profile_interval_conveyance(stations, elevations, n0, center, left_bank, right_bank, u, left, right,
+                                         k_decay, shallow_factor, deep_factor) - target
+        if f == 0.0:
+            return u
+        if f > 0.0:
+            hi, f_hi = u, f
+            if side == 1:
+                f_lo *= 0.5
+            side = 1
+        else:
+            lo, f_lo = u, f
+            if side == -1:
+                f_hi *= 0.5
+            side = -1
+    return hi
+
+
+@njit(cache=True, error_model="numpy")
+def wse_for_profile_conveyance(stations, elevations, mannings_n, center, left_bank, right_bank, target, k_decay,
+                               shallow_factor, deep_factor, max_wse=np.inf):
+    """wse_for_depth_varying_conveyance on a profile: the lowest water surface elevation whose conveyance reaches
+    target, the elevation of the high point where conveyance jumps past it, or NaN if it isn't reached at or below
+    max_wse, or ever."""
+    n = elevations.size
+    level = float(elevations[center])
+    if target <= 0.0:
+        return level
+    left = right = center
+    while True:
+        # Once the water is above this level, each side's edge moves past any ground no higher than it
+        while right < n - 1 and elevations[right + 1] <= level:
+            right += 1
+        while left > 0 and elevations[left - 1] <= level:
+            left -= 1
+        if level > max_wse:
+            return np.nan
+        k_start = _profile_interval_conveyance(stations, elevations, mannings_n, center, left_bank, right_bank, level,
+                                               left, right, k_decay, shallow_factor, deep_factor)
+        if k_start >= target:
+            return level
+        next_right = elevations[right + 1] if right < n - 1 else np.inf
+        next_left = elevations[left - 1] if left > 0 else np.inf
+        end = min(next_right, next_left)
+        if end == np.inf:
+            # Both sides are at their walls, and conveyance grows without bound with the depth
+            height = 1.0
+            top = level + height
+            k_top = _profile_interval_conveyance(stations, elevations, mannings_n, center, left_bank, right_bank, top,
+                                                 left, right, k_decay, shallow_factor, deep_factor)
+            if not k_top > k_start:
+                return np.nan  # no width between the walls, so this section never carries any water
+            while k_top < target and top < max_wse:
+                height *= 2.0
+                top = level + height
+                k_top = _profile_interval_conveyance(stations, elevations, mannings_n, center, left_bank, right_bank,
+                                                     top, left, right, k_decay, shallow_factor, deep_factor)
+        else:
+            top = end
+            k_top = _profile_interval_conveyance(stations, elevations, mannings_n, center, left_bank, right_bank, top,
+                                                 left, right, k_decay, shallow_factor, deep_factor)
+        if k_top >= target:
+            answer = _profile_solve_interval(stations, elevations, mannings_n, center, left_bank, right_bank, left,
+                                             right, k_decay, shallow_factor, deep_factor, level, top, k_start, k_top,
+                                             target)
+            return answer if answer <= max_wse else np.nan
+        if end == np.inf or end > max_wse:
+            return np.nan
+        level = end
+
+
+def hydraulic_geometry(xs: XSection, *, wse: float | None = None, depth: float | None = None,
+                       roughness: DepthRoughness | None = None) -> HydraulicGeometry:
     """Wetted geometry at a water surface elevation, or at a depth above the stream cell. Zero when dry.
 
     The banks don't change the geometry, so this is the whole cross section's either way. See compound_geometry
-    for each subsection's.
+    for each subsection's. With roughness, Manning's n varies with the depth (see DepthRoughness), which changes the
+    composite n and nothing else.
     """
-    wse = _resolve_wse(float(xs.elevations[xs.elevations.size // 2]), wse, depth)
+    wse = _resolve_wse(_center_elevation(xs), wse, depth)
+    if xs.profile is not None:
+        return _to_hydraulic_geometry(*profile_compound_geometry(*xs.profile, -1.0, -1.0, wse,
+                                                                 *_parameters(roughness))[1])
+    if roughness is not None:
+        return _to_hydraulic_geometry(*depth_varying_geometry(xs.elevations, xs.mannings_n, xs.ordinate_distance,
+                                                              wse, *_check_roughness(roughness)))
     return _to_hydraulic_geometry(*wetted_geometry(xs.elevations, xs.mannings_n, xs.ordinate_distance, wse))
 
 
-def compound_geometry(xs: XSection, *, wse: float | None = None, depth: float | None = None) -> CompoundGeometry:
+def compound_geometry(xs: XSection, *, wse: float | None = None, depth: float | None = None,
+                      roughness: DepthRoughness | None = None) -> CompoundGeometry:
     """Wetted geometry of the left overbank, the channel and the right overbank. Without banks, it's all channel."""
-    wse = _resolve_wse(float(xs.elevations[xs.elevations.size // 2]), wse, depth)
+    wse = _resolve_wse(_center_elevation(xs), wse, depth)
+    if xs.profile is not None:
+        return _to_compound_geometry(profile_compound_geometry(*xs.profile, *_bank_distances(xs), wse,
+                                                               *_parameters(roughness)))
+    if roughness is not None:
+        return _to_compound_geometry(depth_varying_compound_geometry(
+            xs.elevations, xs.mannings_n, xs.ordinate_distance, *_bank_distances(xs), wse,
+            *_check_roughness(roughness)))
     return _to_compound_geometry(compound_wetted_geometry(xs.elevations, xs.mannings_n, xs.ordinate_distance,
                                                           *_bank_distances(xs), wse))
 
 
-def discharge(xs: XSection, slope: float, *, wse: float | None = None, depth: float | None = None) -> float:
+def discharge(xs: XSection, slope: float, *, wse: float | None = None, depth: float | None = None,
+              roughness: DepthRoughness | None = None, slope_factor: float = 1.0) -> float:
     """Manning's discharge in m^3/s at a water surface elevation, or at a depth above the stream cell.
 
     With banks, this is the sum of the subsections' discharges, which is not Manning's equation applied to the
-    whole section's hydraulic_geometry.
+    whole section's hydraulic_geometry. With roughness, Manning's n varies with the depth (see DepthRoughness).
+    slope_factor multiplies the square root of the slope, as legacy ARC's slope_adjustment_factor did, and so the
+    discharge.
     """
-    wse = _resolve_wse(float(xs.elevations[xs.elevations.size // 2]), wse, depth)
-    if _has_banks(xs):
+    wse = _resolve_wse(_center_elevation(xs), wse, depth)
+    if xs.profile is not None:
+        k = profile_conveyance(*xs.profile, *_bank_distances(xs), wse, *_parameters(roughness))
+    elif roughness is not None:
+        k = depth_varying_conveyance(xs.elevations, xs.mannings_n, xs.ordinate_distance, *_bank_distances(xs), wse,
+                                     *_check_roughness(roughness))
+    elif _has_banks(xs):
         k = compound_conveyance(xs.elevations, xs.mannings_n, xs.ordinate_distance, *_bank_distances(xs), wse)
     else:
         k = conveyance(xs.elevations, xs.mannings_n, xs.ordinate_distance, wse)
-    return k * _sqrt_slope(slope)
+    return k * _sqrt_slope(slope) * _check_slope_factor(slope_factor)
 
 
-def wse_for_discharge(xs: XSection, q: float, slope: float) -> float:
+def wse_for_discharge(xs: XSection, q: float, slope: float, *, roughness: DepthRoughness | None = None,
+                      slope_factor: float = 1.0) -> float:
     """The lowest water surface elevation at which the cross section carries q m^3/s.
 
     Discharge doesn't always rise with the water level: when water spreads onto flat ground, the wetted
     perimeter can grow faster than the area. Taking the lowest match gives the level that a rising water
-    surface reaches first. See wse_for_conveyance for the other special cases.
+    surface reaches first. See wse_for_conveyance for the other special cases. roughness and slope_factor are as
+    for discharge.
     """
-    target = q / _sqrt_slope(slope)
+    target = q / (_sqrt_slope(slope) * _check_slope_factor(slope_factor))
+    if xs.profile is not None:
+        return float(wse_for_profile_conveyance(*xs.profile, *_bank_distances(xs), target, *_parameters(roughness)))
+    if roughness is not None:
+        return float(wse_for_depth_varying_conveyance(xs.elevations, xs.mannings_n, xs.ordinate_distance,
+                                                      *_bank_distances(xs), target, *_check_roughness(roughness)))
     if _has_banks(xs):
         return wse_for_compound_conveyance(xs.elevations, xs.mannings_n, xs.ordinate_distance,
                                            *_bank_distances(xs), target)
@@ -979,10 +1499,14 @@ class ConveyanceTable:
     the discharge at a water surface elevation, and the water surface elevation for a discharge, each take a
     binary search and at most a few Newton steps, with no loss of accuracy. The table doesn't depend on
     slope, so one table serves every slope. Limit max_depth to the deepest water you need, to build less.
-    A cross section with banks gets a compound table, divided at its banks.
+    A cross section with banks gets a compound table, divided at its banks. A table is built from the ordinates, so
+    not for a cross section with a carved channel's profile, whose shape falls between them.
     """
 
     def __init__(self, xs: XSection, max_depth: float | None = None):
+        if xs.profile is not None:
+            raise ValueError("A conveyance table is built from the ordinates, not a carved channel's profile; use "
+                             "the functions taking an XSection instead.")
         self.center_elevation = float(xs.elevations[xs.elevations.size // 2])
         max_wse = np.inf if max_depth is None else self.center_elevation + max_depth
         self.compound = _has_banks(xs)
@@ -1006,15 +1530,17 @@ class ConveyanceTable:
         none = (0.0, 0.0, 0.0, 0.0) if whole[1] >= 0.0 else whole  # NaN above the table
         return _to_compound_geometry((none, whole, none))
 
-    def discharge(self, slope: float, *, wse: float | None = None, depth: float | None = None) -> float:
+    def discharge(self, slope: float, *, wse: float | None = None, depth: float | None = None,
+                  slope_factor: float = 1.0) -> float:
         wse = _resolve_wse(self.center_elevation, wse, depth)
+        scale = _sqrt_slope(slope) * _check_slope_factor(slope_factor)
         if self.compound:
-            return compound_table_conveyance(self.table, wse) * _sqrt_slope(slope)
-        return table_conveyance(self.table, wse) * _sqrt_slope(slope)
+            return compound_table_conveyance(self.table, wse) * scale
+        return table_conveyance(self.table, wse) * scale
 
-    def wse_for_discharge(self, q: float, slope: float) -> float:
+    def wse_for_discharge(self, q: float, slope: float, *, slope_factor: float = 1.0) -> float:
         """The lowest water surface elevation at which the cross section carries q m^3/s (see wse_for_discharge)."""
-        target = q / _sqrt_slope(slope)
+        target = q / (_sqrt_slope(slope) * _check_slope_factor(slope_factor))
         if self.compound:
             return compound_table_wse_for_conveyance(self.table, target)
         return table_wse_for_conveyance(self.table, target)
@@ -1022,6 +1548,20 @@ class ConveyanceTable:
 
 def _bank_distances(xs: XSection) -> tuple[float, float]:
     return float(xs.left_bank_distance), float(xs.right_bank_distance)
+
+
+def _center_elevation(xs: XSection) -> float:
+    if xs.profile is not None:
+        return float(xs.profile.elevations[xs.profile.center])
+    return float(xs.elevations[xs.elevations.size // 2])
+
+
+_CONSTANT_N = (1.0, 1.0, 1.0)  # depth-varying roughness parameters that leave n as it is
+
+
+def _parameters(roughness: DepthRoughness | None) -> tuple[float, float, float]:
+    """The profile functions' roughness parameters: roughness's, checked, or ones that leave n as it is."""
+    return _CONSTANT_N if roughness is None else _check_roughness(roughness)
 
 
 def _has_banks(xs: XSection) -> bool:
@@ -1052,3 +1592,22 @@ def _sqrt_slope(slope: float) -> float:
     if not slope > 0.0:
         raise ValueError(f"slope must be positive, not {slope!r}.")
     return math.sqrt(slope)
+
+
+def _check_slope_factor(slope_factor: float) -> float:
+    slope_factor = float(slope_factor)
+    if not (math.isfinite(slope_factor) and slope_factor > 0.0):
+        raise ValueError(f"slope_factor must be finite and positive, not {slope_factor!r}.")
+    return slope_factor
+
+
+def _check_roughness(roughness: DepthRoughness) -> tuple[float, float, float]:
+    """The parameters as floats, checked as legacy _adjust_n_by_depth checked them."""
+    k_decay, shallow_factor, deep_factor = (float(v) for v in roughness)
+    if not (math.isfinite(shallow_factor) and shallow_factor >= 1.0):
+        raise ValueError(f"shallow_factor must be finite and >= 1, not {shallow_factor!r}.")
+    if not (math.isfinite(deep_factor) and 0.0 < deep_factor <= 1.0):
+        raise ValueError(f"deep_factor must be finite and in (0, 1], not {deep_factor!r}.")
+    if not (math.isfinite(k_decay) and k_decay > 0.0):
+        raise ValueError(f"k_decay must be finite and > 0, not {k_decay!r}.")
+    return k_decay, shallow_factor, deep_factor

@@ -1,0 +1,113 @@
+"""Each stream cell's rating curve, and the VDT and AP databases written from them.
+
+A RatingCurves holds what legacy ARC's output array held: per stream cell its metadata (COMID, row, column, DEM
+elevation, baseflow, slope, cross-section angle and the channel bed's elevation), and per flow increment its
+discharge, velocity, top width, water surface elevation and wetted perimeter. A cell without a rating curve is NaN
+throughout. The writers make the same files from it that legacy HydraulicData's save_vdt and save_ap did.
+"""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import NamedTuple
+
+import numpy as np
+import pandas as pd
+
+from arc import LOG
+
+METADATA_COLUMNS = ['COMID', 'Row', 'Col', 'Elev', 'QBaseflow', 'Slope', 'XS_Angle', 'BaseElev']
+INCREMENT_FIELDS = ['q', 'v', 't', 'wse', 'p']
+(COMID, ROW, COL, ELEV, QBASEFLOW, SLOPE, XS_ANGLE, BASE_ELEV) = range(8)
+(Q, V, T, WSE, P) = range(5)
+
+
+class RatingCurves(NamedTuple):
+    """Each stream cell's rating curve (see the notes above)."""
+    metadata: np.ndarray  # (cells, 8), in the order of METADATA_COLUMNS
+    increments: np.ndarray  # (cells, increments, 5), in the order of INCREMENT_FIELDS
+
+    @classmethod
+    def empty(cls, cells: int, increments: int) -> RatingCurves:
+        return cls(np.full((cells, len(METADATA_COLUMNS)), np.nan),
+                   np.full((cells, increments, len(INCREMENT_FIELDS)), np.nan))
+
+    @property
+    def number_of_increments(self) -> int:
+        return self.increments.shape[1]
+
+    def columns(self) -> list[str]:
+        return METADATA_COLUMNS + [f"{prefix}_{i}" for i in range(1, self.number_of_increments + 1)
+                                   for prefix in INCREMENT_FIELDS]
+
+    def output_array(self) -> np.ndarray:
+        """Legacy ARC's output array: the metadata, then q, v, t, wse and p for each increment in turn."""
+        return np.concatenate([self.metadata, self.increments.reshape(self.increments.shape[0], -1)], axis=1)
+
+    def has_vdt_data(self) -> bool:
+        """Whether any cell has its last increment (legacy HydraulicData.has_vdt_data)."""
+        return bool(np.any(~np.isnan(self.increments[:, -1, P]))) if self.number_of_increments else False
+
+
+def _write_table(df: pd.DataFrame, path: os.PathLike) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    if str(path).endswith('.parquet'):
+        df.to_parquet(path, compression='brotli', index=False)  # brotli does very well with these tables
+    else:
+        df.to_csv(path, index=False)
+
+
+def vdt_dataframe(curves: RatingCurves) -> pd.DataFrame:
+    """The VDT database (legacy save_vdt): the cells with complete rating curves, without their wetted perimeters
+    or bed elevations, rounded as legacy ARC rounded them, and without rows that repeat or have a negative
+    discharge, velocity or top width."""
+    vdt_df = pd.DataFrame(curves.output_array(), columns=curves.columns())
+    vdt_df = vdt_df.drop(columns=[col for col in vdt_df.columns if col.startswith('p_') or col == 'BaseElev'])
+    vdt_df = vdt_df.dropna()
+    vdt_df = vdt_df.drop_duplicates()
+    for col in ['COMID', 'Row', 'Col']:
+        vdt_df[col] = vdt_df[col].astype(int)
+    for col in vdt_df.columns:
+        if col not in ('Slope', 'XS_Angle'):
+            vdt_df[col] = vdt_df[col].round(3)
+    vdt_df['XS_Angle'] = vdt_df['XS_Angle'].round(7)
+    vdt_df['Slope'] = vdt_df['Slope'].round(8)
+    cols_to_check = [col for col in vdt_df.columns if col.startswith('q') or col.startswith('t') or col.startswith('v')]
+    return vdt_df.loc[~(vdt_df[cols_to_check] < 0).any(axis=1)]
+
+
+def write_vdt(curves: RatingCurves, path: os.PathLike) -> pd.DataFrame:
+    """Write the VDT database, as CSV or, for a .parquet path, Parquet, and return it."""
+    vdt_df = vdt_dataframe(curves)
+    _write_table(vdt_df, path)
+    LOG.info('Finished writing ' + str(path))
+    return vdt_df
+
+
+def ap_dataframe(curves: RatingCurves) -> pd.DataFrame:
+    """The AP database (legacy save_ap): each complete rating curve's discharge, area (discharge over velocity, 0
+    where the velocity is 0) and wetted perimeter, rounded to 3 decimals, without rows that repeat or have a
+    negative value."""
+    n = curves.number_of_increments
+    ap_df = pd.DataFrame(curves.output_array(), columns=curves.columns())
+    ap_df = ap_df.drop(columns=['Elev', 'QBaseflow', 'Slope', 'XS_Angle', 'BaseElev']
+                       + [col for col in ap_df.columns if col.startswith('t_') or col.startswith('wse_')])
+    ap_df = ap_df.dropna()
+    ap_df = ap_df.drop_duplicates()
+    for col in ['COMID', 'Row', 'Col']:
+        ap_df[col] = ap_df[col].astype(int)
+    for i in range(1, n + 1):
+        ap_df[f'a_{i}'] = ap_df[f'q_{i}'].div(ap_df[f'v_{i}'], fill_value=0)
+        ap_df.loc[ap_df[f'v_{i}'] == 0, f'a_{i}'] = 0
+    column_order = ['COMID', 'Row', 'Col'] + [col for i in range(1, n + 1) for col in (f'q_{i}', f'a_{i}', f'p_{i}')]
+    ap_df = ap_df[column_order].round(3)
+    cols_to_check = [col for col in ap_df.columns if col.startswith('q') or col.startswith('a') or col.startswith('p')]
+    return ap_df.loc[~(ap_df[cols_to_check] < 0).any(axis=1)]
+
+
+def write_ap(curves: RatingCurves, path: os.PathLike) -> pd.DataFrame:
+    """Write the AP database, as CSV or, for a .parquet path, Parquet, and return it."""
+    ap_df = ap_dataframe(curves)
+    _write_table(ap_df, path)
+    LOG.info('Finished writing ' + str(path))
+    return ap_df

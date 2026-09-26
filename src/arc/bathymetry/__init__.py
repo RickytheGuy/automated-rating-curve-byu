@@ -8,7 +8,7 @@ the functions they call), for XSection and arc.hydraulics. A cross section goes 
     smoothed = smooth_bank_elevations(network, reaches, dx, dy)  # each reach's filtered banks and bank elevations
     # ...then for each cross section, with its banks from smoothed:
     set_bank_distances(xs, banks)                      # for the hydraulics to divide the channel there
-    depth = bathymetry_depth(xs, banks, baseflow, slope, trapezoid_height=..., bank_elevation=...)
+    depth = bathymetry_depth(xs, banks, baseflow, slope, trapezoid_height=...)
     # ...for every cross section, then along the network again (arc.bathymetry.bed_smoothing):
     channels = smooth_channel_depths(network, reaches, smoothed, depths, dx, dy, use_banks=...)
     # ...then for each cross section, the k-th of its reach:
@@ -25,8 +25,9 @@ bathy_bed_cap). fill_bathymetry_gaps fills the gaps the cross sections leave in 
 list how they differ from legacy ARC.
 
 Banks are distances from the stream cell, not ordinate indices, so a bank can fall between ordinates and a channel's
-top width is the distance between its banks. That is the main way the results differ from legacy ARC. The others
-are errors in the legacy code that aren't repeated here. All of them are listed below.
+top width is the distance between its banks. A channel can be any width, narrower than a cell included, and the
+hydraulics see its exact shape. Those are the main ways the results differ from legacy ARC. The others are errors in
+the legacy code that aren't repeated here. All of them are listed below.
 
 Where legacy ARC used bank indices
 ----------------------------------
@@ -35,18 +36,39 @@ Where legacy ARC used bank indices
   half way between the last ordinate of water and the first that isn't. Legacy used the first that isn't, or with
   bank elevations the last water. A target width is used as it is, where legacy rounded it to whole spacings, at
   least one each side. A bank's elevation is the ground's at the bank, where legacy used its bank ordinate's
-  elevation, which for the width-to-depth ratio was an ordinate under water.
+  elevation, which for the width-to-depth ratio was an ordinate under water. A bank that a width puts within a
+  spacing of the stream cell takes the ground at the neighbouring ordinate, since the DEM can't show a bank inside
+  the stream cell; legacy's single-cell banks were those ordinates.
 - A channel's top width is the distance between its banks. Legacy counted bank_index_1 + bank_index_2 - 1 spacings.
   For width-to-depth and flat-water banks, which were the last ordinates under water, that is one spacing less than
   the distance between those ordinates. It is one to three spacings less than between the water's edges. These
   channels are wider here, and for the same baseflow shallower. On a 20 m bed with 1:1 banks 2 m high (banks 24 m
   apart), legacy found banks at ordinates 12 and 12 and a width of 23 m.
-- A channel is resolved if it is at least two spacings wide, whichever method found it. Legacy needed more than one
-  of its counted cells, which depended on the method's index convention; without bank elevations it was the same
-  test for land-cover banks.
+- A channel found from the DEM or the land cover is resolved if it is at least two spacings wide, whichever method
+  found it. Legacy needed more than one of its counted cells, which depended on the method's index convention;
+  without bank elevations it was the same test for land-cover banks. A channel whose width is given, by a width
+  prior or a reach's median width, can be any width: the width is its evidence, not the DEM.
 - With bank elevations, legacy moved each bank from its ordinate to where the ground reached the bank elevation
   within the next segment, or half a spacing out when it didn't. Here the banks stay where they were found.
   Legacy's own notes describe that as keeping the local bank indices and top widths.
+
+Where legacy ARC was held to its ordinates
+------------------------------------------
+- A single-cell channel, one the DEM can't resolve, is as wide as the width prior that made it, or one spacing, the
+  stream cell's own width. Legacy's was the ordinates either side, two spacings apart, though it counted it as one
+  spacing wide.
+- Every channel is a trapezoid, a single cell included, and its depth is the trapezoid's. Legacy's single cell was
+  a triangle from the stream cell up to the ordinates either side (find_depth_of_bathymetry_triangle), whose
+  heights above the water, without bank elevations, narrowed it.
+- The carve gives the cross section the channel's exact profile, for the hydraulics (arc.bathymetry.channel). Legacy
+  had only the ordinates, on which a channel can't be narrower than two spacings, and a trapezoid a few spacings
+  wide comes out another shape: one two spacings wide was a triangle with 5/8 of the area its depth was solved for.
+  The ordinates, which the raster and the cross-section file get, take the channel's elevation there, as legacy's
+  did, so a channel narrower than a cell sets just its stream cell, to the bed.
+- The ordinates between a single cell's banks are just its stream cell, so only that gets the water's roughness
+  (in_bank). Legacy's bank indices included the ordinates either side.
+- A reach's median width is rebuilt as it is. Legacy widened a median its bank indices couldn't represent a cell at
+  a time, and failing that made a single-cell channel (arc.bathymetry.smoothing).
 
 Errors in the legacy code, not repeated here
 --------------------------------------------
@@ -77,8 +99,7 @@ Errors in the legacy code, not repeated here
 
 Numerical differences
 ---------------------
-- Depths are solved exactly. Legacy stepped the depth: a trapezoid came out up to 1 cm shallow and a triangle up to
-  10 cm deep.
+- Depths are solved exactly. Legacy stepped the depth, and a trapezoid came out up to 1 cm shallow.
 - A slope that isn't positive gives a NaN depth, which carves nothing. Legacy stepped to 25 m.
 - Without bank elevations, the channel only lowers ground lower than the cross section's own elevations. Legacy
   compared against the DEM cell, and an XSection holds no DEM values.
@@ -100,8 +121,7 @@ from arc.bathymetry.banks import (Banks, bank_control_elevation, banks_at_elevat
                                   in_bank, set_bank_distances, set_in_bank_roughness, single_cell_banks)
 from arc.bathymetry.bed_smoothing import ChannelDepths, fill_reach_depths, smooth_channel_depths, smooth_reach_bed
 from arc.bathymetry.channel import carve_channel
-from arc.bathymetry.depth import (BathymetryDepth, bathymetry_depth, channel_depth, power_law_geometry,
-                                  trapezoid_depth, triangle_depth)
+from arc.bathymetry.depth import BathymetryDepth, bathymetry_depth, channel_depth, power_law_geometry, trapezoid_depth
 from arc.bathymetry.raster import burn_into_raster, fill_bathymetry_gaps, ordinate_cells, sample_land_cover
 from arc.bathymetry.smoothing import ReachSections, ReachWidths, SmoothedReach, reach_network, smooth_bank_elevations
 
@@ -112,5 +132,4 @@ __all__ = [
     "channel_depth", "fill_bathymetry_gaps", "fill_reach_depths", "find_banks", "in_bank", "ordinate_cells",
     "power_law_geometry", "reach_network", "sample_land_cover", "set_bank_distances", "set_in_bank_roughness",
     "single_cell_banks", "smooth_bank_elevations", "smooth_channel_depths", "smooth_reach_bed", "trapezoid_depth",
-    "triangle_depth",
 ]

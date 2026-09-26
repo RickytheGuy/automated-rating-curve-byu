@@ -7,7 +7,7 @@ smooth_bank_elevations does it all:
 
 1. Each reach's widths are filtered (filter_reach_widths). A valid channel narrower than the reach's 25th percentile
    width or wider than its 75th gets banks for the reach's median width instead, and so does a cross section
-   without valid banks.
+   without valid banks. The median can be narrower than a cell.
 2. Each cross section's lower bank above its stream cell is an observation of the reach's bank elevation, leaving
    out those below the reach's 2nd percentile or above its 97th (reach_bank_observations). With four or more, that
    always leaves out the lowest and the highest, unless another ties with them.
@@ -19,11 +19,12 @@ smooth_bank_elevations does it all:
 
 Where legacy ARC used bank indices
 ----------------------------------
-- A channel's width is the distance between its banks, so a single-cell channel is two spacings wide (its banks are
-  the ordinates either side), where legacy counted one. Banks for a width are exactly that width, where legacy
-  rounded to whole spacings, so a rebuilt width is the reach's median. It only needs widening where a cross section
-  can't hold it: a median between one and two of its spacings, or one wider than it reaches.
-- An observation is the ground's elevation at the lower bank, not its bank ordinate's.
+- A channel's width is the distance between its banks. A single-cell channel is one spacing wide, as legacy counted
+  it, or as wide as the width prior that made it. Banks for a width are exactly that width, narrower than a cell
+  included, where legacy rounded to whole spacings, at least one each side. So a rebuilt channel is the reach's
+  median width, or as much of it as the cross section holds.
+- An observation is the ground's elevation at the lower bank, not its bank ordinate's. For a bank a width put within
+  a spacing of the stream cell, that's the ground at the neighbouring ordinate, as legacy's single-cell banks were.
 
 Errors in the legacy code, not repeated here
 --------------------------------------------
@@ -36,7 +37,12 @@ Errors in the legacy code, not repeated here
 - A reach with no reach next to it that had cross sections was put in order along a straight line through its
   cells, and got stations 0, 1, 2 and so on, not metres. Its own comments say a straight line can reverse or scramble
   a curved reach. Here it's in order along its cells from one end, with stations in metres. Which end is upstream is
-  decided as legacy did.
+  decided as legacy did, but for the next error.
+- Deciding which end of such a reach is upstream, legacy compared the observations of the ten cross sections at
+  each end, and left the reach as it was if either ten had none, as where a reach's last few cross sections have no
+  valid banks. On the South Fork Peachtree site that put a reach falling 30 m east to west in order from west to
+  east, and the bank elevation, which can only fall along the reach, stayed at the west end's for all of it. Here
+  it's the ten observations nearest each end, wherever they are.
 - Cells a reach's path couldn't reach, across a gap in its cells, got their straight-line distance to its downstream
   end, which can put them out of order. Here the path jumps the gap (see arc.xsection.stream_path).
 - A reach missing from the network made the ordering fail with networkx's NetworkXError. Here it's a ValueError
@@ -65,12 +71,11 @@ import networkx as nx
 import numpy as np
 from numba import njit
 
-from arc.bathymetry.banks import Banks, bank_control_elevation, banks_for_width, single_cell_banks
+from arc.bathymetry.banks import Banks, bank_control_elevation, banks_for_width
 from arc.xsection.stream_path import along_stream_stations, downstream_order
 from arc.xsection.xsection import XSection
 
 MIN_GRADE = 1e-4  # every reach and every cross section falls at least this much per metre downstream
-MAXIMUM_WIDTH_INCREASE = 10  # how many spacings wider than the median width a rebuilt channel may be
 OUTLIER_PERCENTILES = (2, 97)  # observations outside these percentiles of their reach's are left out
 ORIENTING_CELLS = 10  # how many cross sections at each end decide which end of an unconnected reach is upstream
 
@@ -109,11 +114,12 @@ def filter_reach_widths(sections: Sequence[XSection], banks: Sequence[Banks]) ->
     """A reach's banks with its outlying widths replaced, and the percentiles of its valid widths (legacy
     _apply_reach_top_width_filter and _apply_reach_median_top_width_to_missing_bank).
 
-    A valid channel narrower than the 25th percentile or wider than the 75th is rebuilt at the median width
-    (banks_for_width), widened a spacing at a time up to ten spacings until the banks are valid and no wider than the
-    75th percentile. If none are, it becomes a single-cell channel, or stays as it was where it can't be one. A cross
-    section without valid banks gets banks for the median width, if they're valid. None, and the banks unchanged, if
-    no cross section has valid banks.
+    A valid channel narrower than the 25th percentile or wider than the 75th, and a cross section without valid
+    banks, get banks for the median width (banks_for_width), or for as much of it as the cross section holds. Where
+    those aren't valid, with the cross section off the raster on one side of the stream cell, the banks stay as they
+    were. Legacy widened a median its bank indices couldn't represent a cell at a time, up to ten cells and no wider
+    than the 75th percentile, and failing that made a single-cell channel; any width can be represented here. None,
+    and the banks unchanged, if no cross section has valid banks.
     """
     if len(sections) != len(banks):
         raise ValueError(f"There are {len(sections)} cross sections but {len(banks)} banks.")
@@ -123,23 +129,11 @@ def filter_reach_widths(sections: Sequence[XSection], banks: Sequence[Banks]) ->
         return banks, None
     q25, median, q75 = (float(p) for p in np.percentile(widths, [25, 50, 75]))
     for k, (xs, b) in enumerate(zip(sections, banks)):
-        if b.valid and (b.top_width < q25 or b.top_width > q75):
-            banks[k] = _rebuilt_at_median(xs, b, median, q75)
-        elif not b.valid:
+        if not b.valid or b.top_width < q25 or b.top_width > q75:
             rebuilt = banks_for_width(xs, median)
             if rebuilt.valid:
                 banks[k] = rebuilt
     return banks, ReachWidths(q25, median, q75)
-
-
-def _rebuilt_at_median(xs: XSection, banks: Banks, median: float, q75: float) -> Banks:
-    widest = q75 + np.finfo(np.float64).eps * max(abs(q75), 1.0)
-    for increase in range(MAXIMUM_WIDTH_INCREASE + 1):
-        rebuilt = banks_for_width(xs, median + increase * float(xs.ordinate_distance))
-        if rebuilt.valid and rebuilt.top_width <= widest:
-            return rebuilt
-    single_cell = single_cell_banks(xs)
-    return single_cell if single_cell.valid else banks
 
 
 def reach_bank_observations(sections: Sequence[XSection], banks: Sequence[Banks]) -> tuple[np.ndarray, float, float]:
@@ -198,10 +192,10 @@ def _higher_end_is_downstream(ordered_observations: np.ndarray, unconnected: boo
         lowest = finite[np.argmin(ordered_observations[finite])]
         if highest != lowest:
             return bool(highest > lowest)
-    count = min(ORIENTING_CELLS, ordered_observations.size)
-    first, last = ordered_observations[:count], ordered_observations[-count:]
-    first, last = first[np.isfinite(first)], last[np.isfinite(last)]
-    return bool(first.size > 0 and last.size > 0 and first.mean() < last.mean())
+    # The ten observations nearest each end, whichever cross sections they're at
+    observed = ordered_observations[finite]
+    count = min(ORIENTING_CELLS, observed.size)
+    return bool(count > 0 and observed[:count].mean() < observed[-count:].mean())
 
 
 # --- The network --------------------------------------------------------------------------------------------------
@@ -532,9 +526,7 @@ def smooth_bank_elevations(network: nx.DiGraph, reaches: Mapping[int, ReachSecti
     finite = {reach: p[2][np.isfinite(p[2])] for reach, p in prepared.items()}
     minima = {reach: float(values.min()) for reach, values in finite.items() if values.size > 0}
     maxima = {reach: float(values.max()) for reach, values in finite.items() if values.size > 0}
-    if prepared and not minima:
-        raise ValueError("No reach has a bank elevation above its stream cells, so the network can't be smoothed.")
-    outlets, grades = network_outlet_elevations(network, minima, maxima)
+    outlets, grades = network_outlet_elevations(network, minima, maxima)  # none, if no reach has an observation
 
     smoothed = {}
     for reach, (banks, widths, observations, lower, upper, order, stations, thalwegs) in prepared.items():

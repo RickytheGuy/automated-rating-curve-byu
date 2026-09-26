@@ -13,11 +13,11 @@ from arc.bathymetry import (Banks, bank_control_elevation, banks_at_elevation, b
                             banks_by_land_cover, banks_by_width_to_depth_ratio, banks_for_width, bathymetry_depth,
                             burn_into_raster, carve_channel, channel_depth, fill_bathymetry_gaps, find_banks, in_bank,
                             ordinate_cells, power_law_geometry, sample_land_cover, set_bank_distances,
-                            set_in_bank_roughness, single_cell_banks, trapezoid_depth, triangle_depth)
+                            set_in_bank_roughness, single_cell_banks, trapezoid_depth)
 from arc.bathymetry import banks as banks_module
 from arc.bathymetry import channel as channel_module
 from arc.cross_section import (CrossSection, _adjust_one_side_for_bathymetry, _find_bank_using_width_to_depth_ratio,
-                               find_depth_of_bathymetry, find_depth_of_bathymetry_triangle)
+                               find_depth_of_bathymetry)
 from arc.xsection.xsection import XSection
 
 BED = 100.0
@@ -49,14 +49,6 @@ def trapezoid_discharge(depth, bottom, top, slope=SLOPE, n=N):
     side = (top - bottom) / 2
     area = depth * (bottom + top) / 2
     perimeter = bottom + 2 * math.hypot(side, depth)
-    return area * (area / perimeter) ** (2 / 3) * math.sqrt(slope) / n
-
-
-def triangle_discharge(depth, spacing, left_height, right_height, slope=SLOPE, n=N):
-    left = spacing * depth / (depth + max(left_height, 0.0))
-    right = spacing * depth / (depth + max(right_height, 0.0))
-    area = 0.5 * depth * (left + right)
-    perimeter = math.hypot(left, depth) + math.hypot(right, depth)
     return area * (area / perimeter) ** (2 / 3) * math.sqrt(slope) / n
 
 
@@ -222,15 +214,42 @@ def test_land_cover_off_the_raster_is_no_bank() -> None:
 
 @pytest.mark.parametrize("spacing, widest", [(1.0, 2.0), (14.9, 29.8), (15.0, 15.0), (30.0, 30.0)])
 def test_a_width_prior_of_two_spacings_or_less_makes_a_single_cell_channel(spacing: float, widest: float) -> None:
-    """One spacing or less from 15 m up. Legacy returned None, and so no single-cell channel, at exactly 15 m."""
+    """One spacing or less from 15 m up. Legacy returned None, and so no single-cell channel, at exactly 15 m. The
+    channel is the prior's width, and its banks' elevations are the ordinates' either side, as legacy's were."""
     xs = symmetric(BED + np.arange(0.0, 11.0), spacing)
 
     assert find_banks(xs, target_width=widest).single_cell
     assert not find_banks(xs, target_width=widest * 1.001).single_cell
-    banks = find_banks(xs, target_width=widest)
-    assert (banks.left, banks.right) == (spacing, spacing)
-    assert (banks.left_elevation, banks.right_elevation) == (BED + 1.0, BED + 1.0)
-    assert banks.valid and banks.method == "single_cell"
+    for width in (widest, 0.3 * spacing):
+        banks = find_banks(xs, target_width=width)
+        assert (banks.left, banks.right) == (width / 2, width / 2)
+        assert (banks.left_elevation, banks.right_elevation) == (BED + 1.0, BED + 1.0)
+        assert banks.valid and banks.method == "single_cell"
+
+
+def test_a_single_cell_channel_is_the_stream_cell_s_width() -> None:
+    """Half a spacing either side of the stream cell, with the neighbours' elevations. Legacy's banks were the
+    neighbours, two spacings apart, which it counted as one."""
+    xs = make_section([BED + 3.0, BED + 1.5, BED, BED + 0.5, BED + 3.0], spacing=10.0)
+    banks = single_cell_banks(xs)
+
+    assert (banks.left, banks.right, banks.top_width) == (5.0, 5.0, 10.0)
+    assert (banks.left_elevation, banks.right_elevation) == (BED + 1.5, BED + 0.5)
+    assert banks.valid and banks.single_cell
+
+
+def test_banks_a_width_puts_within_a_spacing_take_the_neighbours_ground() -> None:
+    """The DEM can't show a bank inside the stream cell, so the ordinate beside it stands in. Further out, the ground
+    at the bank, as for any other bank."""
+    xs = make_section([BED + 5.0, BED + 3.0, BED + 1.0, BED, BED + 2.0, BED + 4.0, BED + 6.0], spacing=10.0)
+
+    for width in (4.0, 10.0, 16.0, 20.0):
+        banks = banks_for_width(xs, width)
+        assert (banks.left_elevation, banks.right_elevation) == (BED + 1.0, BED + 2.0)
+    banks = banks_for_width(xs, 30.0)  # 15 m out, half way to the next ordinates
+    assert (banks.left_elevation, banks.right_elevation) == pytest.approx((BED + 2.0, BED + 3.0))
+    # Banks found from the DEM keep the ground where they are, however near
+    assert banks_at_elevation(xs, BED + 0.5).left_elevation == pytest.approx(BED + 0.5)
 
 
 def test_a_single_cell_channel_needs_an_ordinate_on_the_raster_each_side() -> None:
@@ -275,8 +294,14 @@ def test_banks_for_a_width_split_it_between_the_sides() -> None:
     short_both = make_section([WALL] * 7 + [BED] * 11 + [WALL] * 3)
     assert (banks_for_width(short_both, 12.0).left, banks_for_width(short_both, 12.0).right) == pytest.approx((3.0, 7.0))
     assert banks_for_width(xs, 100.0).top_width == pytest.approx(40.0)  # the whole section
-    assert banks_for_width(xs, 0.8).single_cell
-    assert not banks_for_width(xs, 1.5).valid  # wider than a cell, narrower than two spacings
+    assert banks_for_width(xs, 100.0).valid
+    # Any width, narrower than a cell included
+    for width in (0.8, 1.5):
+        banks = banks_for_width(xs, width)
+        assert (banks.left, banks.right) == pytest.approx((width / 2, width / 2))
+        assert banks.valid and banks.method == "target_width" and not banks.single_cell
+    assert not banks_for_width(make_section([WALL, BED, BED + 1.0]), 0.5).valid  # off the raster to the left
+    assert not banks_for_width(xs, 0.0).valid and not banks_for_width(xs, math.nan).valid
 
 
 def test_banks_for_a_width_match_legacy() -> None:
@@ -332,8 +357,9 @@ def test_in_bank_ordinates_get_the_water_s_roughness() -> None:
     assert xs.mannings_n[7:13].tolist() == [0.02] * 6
     assert xs.mannings_n[6] == xs.mannings_n[13] == 0.035
     assert not in_bank(xs, banks._replace(valid=False)).any()
-    # A single-cell channel's banks, the ordinates either side, are included
-    assert np.flatnonzero(in_bank(xs, single_cell_banks(xs))).tolist() == [9, 10, 11]
+    # A single-cell channel's banks are half a spacing out, so only its stream cell is between them. Legacy's bank
+    # indices, the ordinates either side, were included too.
+    assert np.flatnonzero(in_bank(xs, single_cell_banks(xs))).tolist() == [10]
 
 
 # --- Depth --------------------------------------------------------------------------------------------------------
@@ -359,48 +385,29 @@ def test_a_trapezoid_s_depth_is_legacy_s_to_within_its_1_cm_steps() -> None:
             assert legacy - 1e-9 < trapezoid_depth(q, bottom, top, slope, N) <= legacy + 0.01 + 1e-9
 
 
-@pytest.mark.parametrize("heights", [(0.0, 0.0), (0.5, 0.8), (3.0, -1.0)])
-@pytest.mark.parametrize("q", [0.01, 1.0, 50.0])
-def test_a_triangle_s_depth_carries_the_baseflow(q: float, heights: tuple[float, float]) -> None:
-    depth = triangle_depth(q, 10.0, *heights, SLOPE, N)
-
-    assert triangle_discharge(depth, 10.0, *heights) == pytest.approx(q, rel=1e-12)
-
-
-def test_a_triangle_s_depth_is_legacy_s_to_within_its_10_cm_steps() -> None:
-    """Legacy stepped the depth up 10 cm at a time and returned the first depth carrying the baseflow."""
-    rng = np.random.default_rng(8)
-    for _ in range(500):
-        spacing = float(rng.uniform(1.0, 50.0))
-        left, right = float(rng.uniform(-1.0, 3.0)), float(rng.uniform(-1.0, 3.0))
-        q = float(np.exp(rng.uniform(math.log(0.01), math.log(1000.0))))
-        slope = float(np.exp(rng.uniform(math.log(1e-5), math.log(0.05))))
-        legacy = find_depth_of_bathymetry_triangle(q, spacing, BED, BED + left, BED + right, slope, N)
-        if legacy < 24.9:
-            assert legacy - 0.1 - 1e-9 <= triangle_depth(q, spacing, left, right, slope, N) < legacy + 1e-9
-
-
-def test_valid_banks_make_a_trapezoid_and_others_a_triangle() -> None:
+def test_every_channel_is_a_trapezoid_as_wide_as_its_banks() -> None:
     xs = channel_and_floodplains()
     banks = find_banks(xs)  # 24 m apart
 
     assert channel_depth(xs, banks, 20.0, SLOPE, trapezoid_height=0.2) == trapezoid_depth(20.0, 14.4, 24.0, SLOPE, N)
-    # Without valid banks, a triangle between the stream cell's neighbours, which are level with it here
+    # Without valid banks, one cell wide: at 1 m spacing, a trapezoid 1 m across the top
     assert channel_depth(xs, banks._replace(valid=False), 2.0, SLOPE, trapezoid_height=0.2) == \
-        triangle_depth(2.0, 1.0, 0.0, 0.0, SLOPE, N)
+        trapezoid_depth(2.0, 0.6, 1.0, SLOPE, N)
 
 
-def test_a_single_cell_channel_s_sides_are_its_neighbours_or_level_with_its_bank_elevation() -> None:
-    """Without bank elevations the neighbours keep their heights above the stream cell. With them, legacy ARC
-    set the whole triangle level with the bank elevation."""
+def test_a_single_cell_channel_is_a_trapezoid_whatever_the_ground_beside_it() -> None:
+    """Legacy's was a triangle up to the ordinates either side, narrowed by how far they stood above the water. Here
+    it's a trapezoid of the single cell's width, as wide as the width prior that made it, if one did."""
     xs = make_section([BED + 3.0, BED + 0.5, BED, BED + 0.8, BED + 3.0], spacing=10.0)
-    banks = single_cell_banks(xs)
 
-    assert channel_depth(xs, banks, 2.0, SLOPE, trapezoid_height=0.2) == pytest.approx(
-        triangle_depth(2.0, 10.0, 0.5, 0.8, SLOPE, N), rel=1e-12)
-    # Even though the neighbours stand above this bank elevation
-    assert channel_depth(xs, banks, 2.0, SLOPE, trapezoid_height=0.2, bank_elevation=BED + 0.2) == \
-        triangle_depth(2.0, 10.0, 0.0, 0.0, SLOPE, N)
+    assert channel_depth(xs, single_cell_banks(xs), 2.0, SLOPE, trapezoid_height=0.2) == \
+        trapezoid_depth(2.0, 6.0, 10.0, SLOPE, N)
+    prior = find_banks(xs, target_width=4.0)
+    assert prior.single_cell
+    assert channel_depth(xs, prior, 2.0, SLOPE, trapezoid_height=0.2) == trapezoid_depth(2.0, 2.4, 4.0, SLOPE, N)
+    # Narrower is deeper, for the same baseflow
+    assert channel_depth(xs, prior, 2.0, SLOPE, trapezoid_height=0.2) > \
+        channel_depth(xs, single_cell_banks(xs), 2.0, SLOPE, trapezoid_height=0.2)
 
 
 def test_no_baseflow_is_no_depth_and_no_slope_no_answer() -> None:
@@ -467,7 +474,8 @@ def test_the_carved_channel_carries_the_baseflow() -> None:
 
     assert banks.method == "flat_water"
     assert banks.top_width == pytest.approx(10.0 + 2 * 0.1 / 3, rel=1e-9)
-    assert hydraulics.discharge(xs, SLOPE, wse=BED) == pytest.approx(5.0, rel=0.01)
+    # Exactly, since the hydraulics see the carved channel's own shape
+    assert hydraulics.discharge(xs, SLOPE, wse=BED) == pytest.approx(5.0, rel=1e-9)
 
 
 def test_without_bank_elevations_the_channel_only_lowers_the_ground() -> None:
@@ -602,6 +610,140 @@ def test_a_trapezoid_height_of_zero_is_a_rectangle() -> None:
 
     assert xs.elevations[2] == xs.elevations[22] == BED + 1.0  # the banks are the rectangle's top
     assert (xs.elevations[3:22] == BED - 1.0).all()
+    # Its walls are vertical faces in the profile
+    geometry = hydraulics.hydraulic_geometry(xs, wse=BED)
+    assert (geometry.area, geometry.top_width, geometry.wetted_perimeter) == pytest.approx((20.0, 20.0, 22.0))
+
+
+# --- The carved channel's profile -----------------------------------------------------------------------------------
+
+
+def profile_at(xs: XSection, offsets) -> np.ndarray:
+    """The profile's elevation at these distances from the stream cell, taking a vertical face's inner end."""
+    stations, elevations = xs.profile.stations, xs.profile.elevations
+    values = []
+    for offset in np.atleast_1d(offsets):
+        at = np.flatnonzero(stations == offset)
+        if at.size:
+            values.append(elevations[at[-1] if offset < 0 else at[0]])
+        else:
+            values.append(np.interp(offset, stations, elevations))
+    return np.array(values)
+
+
+def test_a_channel_narrower_than_a_cell_is_its_own_shape_in_the_hydraulics() -> None:
+    """A 12 m wide trapezoid 1.5 m deep in a stream cell 30 m wide. The raster gets the bed at the stream cell, and
+    the ordinates either side keep their ground, but the hydraulics see the channel: at its banks' level its water
+    is the trapezoid, 12 m across, and it carries the baseflow its depth was solved for."""
+    xs = make_section([BED + 6.0, BED + 4.0, BED + 2.0, BED, BED + 2.0, BED + 4.0, BED + 6.0], spacing=30.0)
+    xs.mannings_n[:] = N
+    banks = find_banks(xs, target_width=12.0)
+    depth = channel_depth(xs, banks, 3.0, SLOPE, trapezoid_height=0.2)
+
+    changed = carve_channel(xs, banks, depth, trapezoid_height=0.2)
+
+    assert banks.single_cell and banks.top_width == 12.0
+    assert np.flatnonzero(changed).tolist() == [3]
+    assert xs.elevations[3] == pytest.approx(BED - depth)
+    assert xs.elevations[[2, 4]].tolist() == [BED + 2.0, BED + 2.0]
+    assert xs.profile.stations[xs.profile.center] == 0.0
+    geometry = hydraulics.hydraulic_geometry(xs, wse=BED)
+    assert geometry.top_width == pytest.approx(12.0, rel=1e-12)
+    assert geometry.area == pytest.approx(depth * (12.0 + 7.2) / 2, rel=1e-12)
+    assert hydraulics.discharge(xs, SLOPE, wse=BED) == pytest.approx(3.0, rel=1e-9)
+    # On the ordinates alone the channel would reach the neighbours, 60 m across
+    plain = make_section(xs.elevations, spacing=30.0)
+    assert hydraulics.hydraulic_geometry(plain, wse=BED).top_width == pytest.approx(60.0 * depth / (depth + 2.0))
+
+
+def test_a_two_spacing_trapezoid_is_a_trapezoid_not_a_triangle() -> None:
+    """Banks 1 m either side at 1 m spacing: the ordinates are the banks and the stream cell, which on their own make
+    a triangle with 5/8 of the trapezoid's area at a trapezoid height of 0.2."""
+    xs = make_section(np.full(9, BED))
+    banks = Banks("test", 1.0, 1.0, BED, BED, False, True)
+
+    carve_channel(xs, banks, 1.0, trapezoid_height=0.2, bank_elevation=BED)
+
+    assert xs.elevations.tolist() == [BED] * 3 + [BED, BED - 1.0, BED] + [BED] * 3
+    assert hydraulics.hydraulic_geometry(xs, wse=BED).area == pytest.approx(1.6)
+    assert hydraulics.hydraulic_geometry(make_section(xs.elevations), wse=BED).area == pytest.approx(1.0)
+
+
+def test_the_ground_runs_straight_from_each_bank_top_to_the_first_ordinate_beyond() -> None:
+    """With bank elevations the channel's banks are at the bank elevation, here above the stream cell's ground. The
+    ground beside the channel doesn't dip back down to the stream cell's old elevation, as it would if it were
+    interpolated between the stream cell and its neighbour: it rises from the bank top to the neighbour."""
+    xs = make_section([BED + 6.0, BED + 4.0, BED + 2.0, BED, BED + 2.0, BED + 4.0, BED + 6.0], spacing=30.0)
+    banks = find_banks(xs, target_width=10.0)
+
+    carve_channel(xs, banks, 1.0, trapezoid_height=0.2, bank_elevation=BED + 1.8)
+
+    np.testing.assert_allclose(profile_at(xs, [-30.0, -15.0, -5.0, -3.0, 0.0, 3.0, 5.0, 15.0, 30.0]),
+                               [BED + 2.0, BED + 1.88, BED + 1.8, BED + 0.8, BED + 0.8, BED + 0.8, BED + 1.8,
+                                BED + 1.88, BED + 2.0])
+    assert np.all(np.diff(xs.profile.stations) >= 0.0)
+
+
+def test_without_bank_elevations_the_profile_is_the_lower_of_the_ground_and_the_channel() -> None:
+    """A pool below the channel's bed keeps its ground, and where the ground crosses the channel's side the profile
+    turns there."""
+    xs = make_section(np.full(25, BED))
+    xs.elevations[4:7] = 97.0  # 6 to 8 m left of the stream cell, below the 98 m bed
+    original = xs.elevations.copy()
+
+    carve_channel(xs, BANKS_10_M_OUT, 2.0, trapezoid_height=0.2)
+
+    offsets = np.linspace(-12.0, 12.0, 481)
+    ground = np.interp(offsets, np.arange(-12.0, 13.0), original)
+    channel = np.where(np.abs(offsets) <= 10.0, 98.0 + 2.0 * np.maximum(1.0 - (10.0 - np.abs(offsets)) / 4.0, 0.0),
+                       np.inf)
+    np.testing.assert_allclose(profile_at(xs, offsets), np.minimum(ground, channel), atol=1e-12)
+
+
+@pytest.mark.parametrize("use_banks", [False, True])
+def test_the_profile_goes_through_the_carved_ordinates(use_banks: bool) -> None:
+    """On random sections, banks, depths and trapezoid heights: the profile is the carved ordinates' elevation at
+    each ordinate, the ground outside the banks, and without bank elevations never above the ground."""
+    rng = np.random.default_rng(10)
+    for _ in range(300):
+        spacing = float(rng.choice([1.0, 7.5, 30.0]))
+        xs = random_section(rng, 2 * int(rng.integers(2, 20)) + 1, spacing)
+        ground = xs.elevations.copy()
+        center = ground.size // 2
+        left, right = (float(rng.uniform(0.05, center) * spacing) for _ in range(2))
+        if rng.random() < 0.3:
+            left = float(rng.integers(1, center + 1) * spacing)  # a bank on an ordinate
+        banks = Banks("test", left, right, np.nan, np.nan, False, True)
+        reference = BED + float(rng.uniform(0.0, 2.0)) if use_banks else None
+
+        changed = carve_channel(xs, banks, float(rng.uniform(0.05, 3.0)),
+                                trapezoid_height=float(rng.uniform(0.0, 0.5)), bank_elevation=reference)
+
+        offsets = (np.arange(ground.size) - center) * spacing
+        outside = (offsets < -left - 1e-9 * spacing) | (offsets > right + 1e-9 * spacing)
+        assert not changed[outside].any()
+        stations = xs.profile.stations
+        assert np.all(np.diff(stations) >= 0.0) and stations[xs.profile.center] == 0.0
+        interior = ~outside & (np.abs(offsets + left) > 1e-9 * spacing) & (np.abs(offsets - right) > 1e-9 * spacing)
+        np.testing.assert_allclose(profile_at(xs, offsets[interior]), xs.elevations[interior], atol=1e-9)
+        np.testing.assert_allclose(profile_at(xs, offsets[outside]), ground[outside], atol=1e-9)
+        if not use_banks:
+            dense = np.linspace(offsets[0], offsets[-1], 2001)
+            assert np.all(profile_at(xs, dense) <= np.interp(dense, offsets, ground) + 1e-9)
+
+
+def test_the_profile_keeps_the_ordinates_roughness() -> None:
+    """Each vertex takes the Manning's n of the segment between ordinates it falls in, its inner ordinate's."""
+    xs = make_section(np.full(9, BED), spacing=10.0)
+    xs.mannings_n[:] = [0.1, 0.09, 0.08, 0.07, 0.03, 0.06, 0.05, 0.04, 0.02]
+
+    carve_channel(xs, Banks("test", 15.0, 4.0, BED, BED, False, True), 1.0, trapezoid_height=0.2,
+                  bank_elevation=BED)
+
+    stations, n = xs.profile.stations, xs.profile.mannings_n
+    expected = {-40.0: 0.1, -30.0: 0.09, -20.0: 0.08, -15.0: 0.07, -11.2: 0.07, 0.0: 0.03, 0.2: 0.03, 4.0: 0.03,
+                10.0: 0.06, 20.0: 0.05, 30.0: 0.04, 40.0: 0.02}
+    assert {float(s): float(v) for s, v in zip(np.round(stations, 9), n)} == pytest.approx(expected)
 
 
 # --- Rasters ------------------------------------------------------------------------------------------------------
@@ -774,11 +916,12 @@ def _repeat_legacy_burn(profile, rows, cols, dem, output, calls):
 
 @njit
 def _repeat_carve(elevations, calls):
+    """The ordinates' carve, legacy's burn's job. The channel's profile is extra, and in the whole-section test."""
     total = 0.0
     changed = np.zeros(elevations.size, dtype=np.bool_)
     for _ in range(calls):
         carved = elevations.copy()
-        channel_module._carve(carved, 10.0, 120.0, 120.0, True, BED, 2.0, 0.2, True, changed)
+        channel_module._carve(carved, 10.0, 120.0, 120.0, BED, 2.0, 0.2, True, changed)
         total += carved[carved.size // 2]
     return total
 

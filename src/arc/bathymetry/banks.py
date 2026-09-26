@@ -3,7 +3,9 @@
 Every method gives the distance from the stream cell to each bank, which can fall between ordinates, and the
 channel's top width is the sum of the two. A search tries the methods in legacy ARC's order and keeps the first
 that resolves a channel at least two ordinate spacings wide, unless a drainage-area width prior says the channel is
-a single cell. See the package notes for how this differs from the legacy bank indices.
+narrower than the DEM can resolve, when the channel is the prior's width. A channel whose width is given, by a prior
+or a reach's median width, can be any width, narrower than a cell included: its banks are wherever the width puts
+them. See the package notes for how this differs from the legacy bank indices.
 """
 from __future__ import annotations
 
@@ -34,9 +36,12 @@ class Banks(NamedTuple):
     """Where a cross section's banks are, and how they were found.
 
     left and right are the distances in metres from the stream cell to the left and right banks (NaN if the method
-    found none), and the elevations are the ground's there. A single-cell channel is too narrow to resolve: its banks
-    are the ordinates either side of the stream cell, and its bathymetry is a triangle between them. valid says the
-    banks can be used: a single-cell channel, or a channel at least two ordinate spacings wide.
+    found none), and the elevations are the ground's there. A bank a width put within a spacing of the stream cell,
+    where the DEM can't show one, takes the ground at the neighbouring ordinate instead, as legacy's single-cell
+    banks did. A single-cell channel is one the DEM can't resolve: as wide as the width prior says, or else one
+    spacing, the stream cell's own width. valid says the banks can be used: a channel whose width was given (single
+    cell or target width) with the cross section on the raster either side, or one found at least two ordinate
+    spacings wide.
     """
     method: str
     left: float
@@ -195,7 +200,7 @@ def _search(elevations, spacing, land_cover, water, target_width):
     center = elevations.size // 2
     if _is_single_cell(target_width, spacing, _on_raster_ordinates(elevations, center, -1),
                        _on_raster_ordinates(elevations, center, 1)):
-        return _SINGLE_CELL, spacing, spacing
+        return _SINGLE_CELL, 0.5 * target_width, 0.5 * target_width
     if land_cover.size == elevations.size:
         left, right = _land_cover_banks(land_cover, water, spacing)
         if _resolved(left, right, spacing):
@@ -210,10 +215,20 @@ def _search(elevations, spacing, land_cover, water, target_width):
 
 
 @njit(cache=True, error_model="numpy")
+def _at_least(distance, spacing):
+    return spacing if distance < spacing else distance  # NaN stays NaN
+
+
+@njit(cache=True, error_model="numpy")
 def _with_elevations(elevations, spacing, method, left, right):
+    """The method and the banks, with the ground's elevations at them (see Banks for a given width's banks within a
+    spacing of the stream cell)."""
     center = elevations.size // 2
-    return (method, left, right, _ground_at(elevations, center, -1, spacing, left),
-            _ground_at(elevations, center, 1, spacing, right))
+    left_at, right_at = left, right
+    if method == _SINGLE_CELL or method == _TARGET_WIDTH:
+        left_at, right_at = _at_least(left, spacing), _at_least(right, spacing)
+    return (method, left, right, _ground_at(elevations, center, -1, spacing, left_at),
+            _ground_at(elevations, center, 1, spacing, right_at))
 
 
 @njit(cache=True, error_model="numpy")
@@ -227,14 +242,14 @@ def find_banks(xs: XSection, *, target_width: float | None = None, land_cover: n
                water_value: float | None = None) -> Banks:
     """Find a cross section's banks, trying in turn, as legacy ARC did:
 
-    1. A single-cell channel, if a drainage-area width prior (target_width) is no wider than two ordinate spacings,
-       or one for spacings of 15 m or more.
+    1. A single-cell channel as wide as a drainage-area width prior (target_width), if the prior is no wider than
+       two ordinate spacings, or one for spacings of 15 m or more.
     2. The land cover, if given (see banks_by_land_cover).
     3. The stage where the ratio of top width to depth stops falling (see banks_by_width_to_depth_ratio).
     4. The water's edges 0.1 m above the stream cell (see banks_by_flat_water).
 
     It keeps the first to resolve a channel at least two ordinate spacings wide. If none does, the banks are not
-    valid, and the bathymetry treats the channel as a single cell.
+    valid, and the bathymetry treats the channel as a single cell (single_cell_banks).
     """
     if land_cover is None:
         values, water = _NO_LAND_COVER, np.nan
@@ -279,10 +294,9 @@ def banks_at_elevation(xs: XSection, elevation: float) -> Banks:
 
 
 def banks_for_width(xs: XSection, width: float) -> Banks:
-    """Banks that make a channel a given width, such as a reach's median width.
-
-    A width of one ordinate spacing or less is a single-cell channel. Otherwise half the width goes on each side, as
-    far as that side stays on the raster, with what one side can't hold on the other.
+    """Banks that make a channel a given width, such as a reach's median width: half the width either side of the
+    stream cell, as far as that side stays on the raster, with what one side can't hold on the other. Any width will
+    do, narrower than a cell included, so long as the cross section is on the raster either side of the stream cell.
     """
     spacing = float(xs.ordinate_distance)
     center = xs.elevations.size // 2
@@ -291,18 +305,17 @@ def banks_for_width(xs: XSection, width: float) -> Banks:
     width = _optional(width)
     if not 0.0 < width < np.inf or left_ordinates < 1 or right_ordinates < 1:
         return _banks(xs, _TARGET_WIDTH, np.nan, np.nan, False)
-    if width <= spacing:
-        return single_cell_banks(xs)
     left, right = _target_width_banks(width, spacing, left_ordinates, right_ordinates)
-    return _banks(xs, _TARGET_WIDTH, left, right, _resolved(left, right, spacing))
+    return _banks(xs, _TARGET_WIDTH, left, right, True)
 
 
 def single_cell_banks(xs: XSection) -> Banks:
-    """The banks of a single-cell channel: the ordinates either side of the stream cell, if they're on the raster."""
+    """The banks of a channel one cell wide, the stream cell's own width: half a spacing either side of it, if the
+    ordinates either side are on the raster. Their elevations are those ordinates' (see Banks)."""
     spacing = float(xs.ordinate_distance)
     center = xs.elevations.size // 2
     valid = _on_raster_ordinates(xs.elevations, center, -1) >= 1 and _on_raster_ordinates(xs.elevations, center, 1) >= 1
-    return _banks(xs, _SINGLE_CELL, spacing, spacing, valid)
+    return _banks(xs, _SINGLE_CELL, 0.5 * spacing, 0.5 * spacing, valid)
 
 
 def set_bank_distances(xs: XSection, banks: Banks) -> None:

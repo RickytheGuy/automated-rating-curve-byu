@@ -12,7 +12,9 @@ from arc._log import LOG
 
 StreamSlopeMethod = Literal["local_average", "local_average_corrected", "reach_average", "end_points"]
 
-_CURVE2FLOOD_KEYS = {'comid_flow_file', 'make_output_gpkg', 'strmorder_field', 'outfld', 'outdep', 'outvel', 'outwse', 'mapper', 'topwidthplausiblelimit', 'tw_multfact', 'set_depth', 'localfloodoption', 'fsoutbathy', 'flood_waterlc_and_strm_cells', 'flow_direction_file', 'filled_dem_file', 'stream_info_file', 'fldpln_library', 'max_wse_rise', 'fldpln_median_filter_size', 'fldpln_max_drop_below_source'}
+_CURVE2FLOOD_KEYS = {'comid_flow_file', 'make_output_gpkg', 'strmorder_field', 'outfld', 'outdep', 'outvel', 'outwse', 'mapper', 'topwidthplausiblelimit', 'tw_multfact', 'set_depth', 'localfloodoption', 'fsoutbathy', 'flood_waterlc_and_strm_cells', 'flow_direction_file', 'filled_dem_file', 'stream_info_file', 'fldpln_library', 'max_wse_rise', 'fldpln_median_filter_size', 'fldpln_max_drop_below_source', 'fs_adjust_flow_by_fraction'}
+# Keys that legacy ARC wrote into its input files (Create_ARC_Model_Input_File) or read, but never used
+_UNUSED_LEGACY_KEYS = {'spatial_units', 'str_limit_val', 'print_vdt', 'bathywatermask'}
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -52,6 +54,9 @@ class Configs:
 
     # Discharge adjustments
     slope_adjustment_factor: float = 1.0
+    # Scale Manning's n with the depth of the water by k_decay, shallow_factor and deep_factor, as legacy ARC always
+    # did (arc.hydraulics.DepthRoughness). False keeps each land cover's n at every depth.
+    depth_varying_n: bool = True
     k_decay: float = 6.0
     shallow_factor: float = 2.0
     deep_factor: float = 1.0
@@ -139,14 +144,15 @@ class Configs:
                 raise ValueError(f'{obsolete_name} has been replaced by shallow_factor and deep_factor; update your ARC inputs.')
 
         known = {f.name for f in fields(cls) if f.init}
-        unknown = sorted(set(params) - known - _CURVE2FLOOD_KEYS)
+        unknown = sorted(set(params) - known - _CURVE2FLOOD_KEYS - _UNUSED_LEGACY_KEYS)
         if unknown:
             described = []
             for key in unknown:
                 close = difflib.get_close_matches(key, sorted(known), n=1)
                 described.append(f'{key!r}' + (f' (did you mean {close[0]!r}?)' if close else ''))
             raise ValueError(f'Unrecognized config key(s): {", ".join(described)}')
-        return params
+        # The curve2flood and unused legacy keys are allowed in the inputs, but aren't fields
+        return {key: value for key, value in params.items() if key in known}
 
     def _coerce_types(self) -> None:
         # Text input files give every value as a string, so convert each one to its field's type

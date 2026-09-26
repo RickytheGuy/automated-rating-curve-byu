@@ -91,6 +91,33 @@ def test_the_bed_cap_is_on_unless_turned_off(tmp_path: Path) -> None:
     assert Configs.from_mapping({**BASE_INPUTS, "BATHY_BED_CAP": "true"}).bathy_bed_cap is True
 
 
+def test_depth_varying_roughness_is_on_unless_turned_off(tmp_path: Path) -> None:
+    """Depth_Varying_N switches legacy's scaling of Manning's n by k_decay, shallow_factor and deep_factor."""
+    text_file = tmp_path / "ARC_Input_File.txt"
+    text_file.write_text("DEM_File\tdem.tif\nDepth_Varying_N\tFalse\n", encoding="utf-8")
+    yaml_file = tmp_path / "ARC_Input_File.yaml"
+    yaml_file.write_text("DEM_File: dem.tif\nDepth_Varying_N: false\nk_decay: 3.0\n", encoding="utf-8")
+
+    assert Configs.from_mapping(BASE_INPUTS).depth_varying_n is True
+    assert Configs.from_file(text_file).depth_varying_n is False
+    configs = Configs.from_file(yaml_file)
+    assert configs.depth_varying_n is False and configs.k_decay == 3.0
+    # The parameters are still checked when the scaling is off
+    with pytest.raises(ValueError, match="k_decay must be finite and positive"):
+        Configs.from_mapping({**BASE_INPUTS, "Depth_Varying_N": False, "k_decay": 0})
+
+
+def test_curve2flood_and_unused_legacy_keys_are_accepted_and_left_out() -> None:
+    """Real ARC inputs share their file with curve2flood, and carry keys legacy ARC wrote but never used."""
+    inputs = {**BASE_INPUTS, "Comid_Flow_File": "flows.csv", "mapper": "Curve2Flood-Kernel Weighted",
+              "TW_MultFact": 1.5, "FS_ADJUST_FLOW_BY_FRACTION": 1.0, "Spatial_Units": "deg",
+              "BathyWaterMask": "mask.tif", "Str_Limit_Val": 1, "Print_VDT": "vdt.txt", "FSOutBATHY": "fs.tif"}
+
+    configs = Configs.from_mapping(inputs)
+
+    assert configs == Configs.from_mapping(BASE_INPUTS)
+
+
 def test_unrecognized_key_is_rejected_with_a_suggestion() -> None:
     with pytest.raises(ValueError, match=r"'x_section_distance' \(did you mean 'x_section_dist'\?\)"):
         Configs.from_mapping({**BASE_INPUTS, "X_Section_Distance": 40})

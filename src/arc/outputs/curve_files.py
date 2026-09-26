@@ -1,0 +1,149 @@
+"""The curve file: power laws fitted to each stream cell's rating curve, or to each reach's.
+
+Depth, top width and velocity are each fitted as a * Q**b by least squares (scipy's curve_fit), as legacy
+HydraulicData's save_curve_file and save_reach_average_curve_file did. qmax is the flow file's maximum-flow column,
+indexed by its IDs, whose values replace the baseflow in the metadata.
+"""
+from __future__ import annotations
+
+import os
+
+import numpy as np
+import pandas as pd
+from numba import njit
+from numba.core.errors import TypingError
+from scipy.optimize import curve_fit
+
+from arc import LOG
+from arc.outputs.rating_curves import Q, T, V, WSE, RatingCurves, _write_table
+
+FAILED_FIT = -9999.9  # legacy's coefficient, power and R² when a fit fails
+# Initial guesses for a and b, as legacy ARC made them
+TOP_WIDTH_GUESS = (12.0, 0.3)
+VELOCITY_GUESS = (1.0, 0.3)
+DEPTH_GUESS = (0.2, 0.5)
+_FIRST_COLUMNS = ['COMID', 'Row', 'Col', 'Elev', 'QBaseflow', 'Slope', 'XS_Angle', 'BaseElev']
+
+
+@njit(cache=True)
+def _power(d_value: np.ndarray, d_coefficient: float, d_power: float):
+    """a * x**b, compiled as legacy power_func was, so that the fits come out the same."""
+    return d_coefficient * (d_value ** d_power)
+
+
+def fit_power_law(x: np.ndarray, y: np.ndarray, init_guess=(1.0, 1.0)) -> tuple[float, float, float]:
+    """a, b and R² of y = a * x**b (legacy _linear_regression_power_function). R² isn't worked out, as legacy's
+    wasn't, so it's -9999.9, and so are a and b when the fit doesn't converge."""
+    coefficient, power, r2 = FAILED_FIT, FAILED_FIT, FAILED_FIT
+    try:
+        (coefficient, power), _ = curve_fit(_power, x, y, p0=list(init_guess))
+    except TypingError as e:
+        LOG.error(e)
+    except RuntimeError:
+        pass
+    return coefficient, power, r2
+
+
+def _round_metadata(df: pd.DataFrame) -> pd.DataFrame:
+    # Most columns are rounded to 3 decimals, but the angle and slope keep more precision
+    for col in df.columns:
+        if col not in ('Slope', 'XS_Angle'):
+            df[col] = df[col].round(3)
+    df['XS_Angle'] = df['XS_Angle'].round(7)
+    df['Slope'] = df['Slope'].round(8)
+    return df
+
+
+def curve_file_dataframe(curves: RatingCurves, qmax: pd.Series) -> pd.DataFrame:
+    """Each cell's power laws (legacy save_curve_file), for the cells whose metadata is complete and whose
+    coefficients are all positive."""
+    df = pd.DataFrame(curves.metadata, columns=['COMID', 'Row', 'Col', 'DEM_Elev', 'QBaseflow', 'Slope', 'XS_Angle',
+                                                'BaseElev'])
+    df = df[['COMID', 'Row', 'Col', 'BaseElev', 'DEM_Elev', 'QBaseflow', 'Slope', 'XS_Angle']]
+    df = df.dropna()
+    for col in ['COMID', 'Row', 'Col']:
+        df[col] = df[col].astype(int)
+    df = df.rename(columns={'QBaseflow': 'QMax'})
+    df['QMax'] = df['COMID'].map(qmax)
+    df = _round_metadata(df)
+
+    fits = {name: [] for name in ('depth_a', 'depth_b', 'tw_a', 'tw_b', 'vel_a', 'vel_b')}
+    for i in df.index:
+        q = curves.increments[i, :, Q]
+        v = curves.increments[i, :, V]
+        t = curves.increments[i, :, T]
+        depth = curves.increments[i, :, WSE] - df.loc[i, 'BaseElev']
+        mask = ~np.isnan(q)
+        if not mask.all():
+            q, t, v, depth = q[mask], t[mask], v[mask], depth[mask]
+        tw_a, tw_b, _ = fit_power_law(q, t, TOP_WIDTH_GUESS)
+        vel_a, vel_b, _ = fit_power_law(q, v, VELOCITY_GUESS)
+        depth_a, depth_b, _ = fit_power_law(q, depth, DEPTH_GUESS)
+        for name, value in (('depth_a', depth_a), ('depth_b', depth_b), ('tw_a', tw_a), ('tw_b', tw_b),
+                            ('vel_a', vel_a), ('vel_b', vel_b)):
+            fits[name].append(value)
+
+    df = pd.concat([df.reset_index(drop=True), pd.DataFrame(fits).round(3)], axis=1)
+    return df.loc[(df['depth_a'] > 0) & (df['tw_a'] > 0) & (df['vel_a'] > 0)]
+
+
+def reach_average_curve_file_dataframe(curves: RatingCurves, vdt_df: pd.DataFrame, qmax: pd.Series) -> pd.DataFrame:
+    """Each reach's power laws, fitted to all of its cells' rating curves in the VDT database, alongside each of
+    its cells' metadata (legacy save_reach_average_curve_file)."""
+    n = curves.number_of_increments
+    df = pd.DataFrame(curves.metadata, columns=_FIRST_COLUMNS).dropna(how='all')
+    df = df[['COMID', 'Row', 'Col', 'BaseElev', 'Elev', 'QBaseflow', 'Slope', 'XS_Angle']]
+    for col in ['COMID', 'Row', 'Col']:
+        df[col] = df[col].astype(int)
+    df = df.rename(columns={'QBaseflow': 'QMax', 'Elev': 'DEM_Elev'})
+    df['QMax'] = df['COMID'].map(qmax)
+    df = _round_metadata(df)
+
+    q_columns = [f'q_{i}' for i in range(1, n + 1)]
+    t_columns = [f't_{i}' for i in range(1, n + 1)]
+    v_columns = [f'v_{i}' for i in range(1, n + 1)]
+    wse_columns = [f'wse_{i}' for i in range(1, n + 1)]
+    fits = {name: [] for name in ('COMID', 'depth_a', 'depth_b', 'tw_a', 'tw_b', 'vel_a', 'vel_b')}
+    for comid, group in vdt_df.groupby("COMID"):
+        # The reach's cells that are in the VDT database, matched on their row and column
+        group_index = pd.MultiIndex.from_arrays([group["Row"].values, group["Col"].values], names=["Row", "Col"])
+        matching = df[(df["COMID"] == comid) & (pd.MultiIndex.from_frame(df[["Row", "Col"]]).isin(group_index))]
+        matching = matching.drop_duplicates(subset=["Row", "Col", "COMID"])
+        if matching.empty:
+            LOG.warning(f"No matching BaseElev values found for COMID {comid}. Skipping...")
+            continue
+        aligned = group.set_index(["Row", "Col"]).join(matching.set_index(["Row", "Col"])["BaseElev"], how="inner")
+        depth = np.concatenate([aligned[c].values - aligned["BaseElev"].values for c in wse_columns])
+        q = np.concatenate([group[c].values for c in q_columns])
+        t = np.concatenate([group[c].values for c in t_columns])
+        v = np.concatenate([group[c].values for c in v_columns])
+        try:
+            tw_a, tw_b, _ = fit_power_law(q, t, TOP_WIDTH_GUESS)
+            vel_a, vel_b, _ = fit_power_law(q, v, VELOCITY_GUESS)
+            depth_a, depth_b, _ = fit_power_law(q, depth, DEPTH_GUESS)
+        except Exception as e:
+            LOG.warning(f"Regression failed for COMID {comid}: {e}")
+            tw_a = tw_b = vel_a = vel_b = depth_a = depth_b = np.nan
+        fits['COMID'].append(comid)
+        for name, value in (('depth_a', depth_a), ('depth_b', depth_b), ('tw_a', tw_a), ('tw_b', tw_b),
+                            ('vel_a', vel_a), ('vel_b', vel_b)):
+            fits[name].append(np.round(value, 3) if not np.isnan(value) else np.nan)
+
+    return df.merge(pd.DataFrame(fits), on="COMID", how="left").dropna()
+
+
+def write_curve_file(curves: RatingCurves, qmax: pd.Series, path: os.PathLike) -> pd.DataFrame:
+    """Write each cell's power laws, as CSV or, for a .parquet path, Parquet, and return them."""
+    df = curve_file_dataframe(curves, qmax)
+    _write_table(df, path)
+    LOG.info('Finished writing ' + str(path))
+    return df
+
+
+def write_reach_average_curve_file(curves: RatingCurves, vdt_df: pd.DataFrame, qmax: pd.Series,
+                                   path: os.PathLike) -> pd.DataFrame:
+    """Write each reach's power laws with its cells' metadata, as CSV or Parquet, and return them."""
+    df = reach_average_curve_file_dataframe(curves, vdt_df, qmax)
+    _write_table(df, path)
+    LOG.info('Finished writing ' + str(path))
+    return df

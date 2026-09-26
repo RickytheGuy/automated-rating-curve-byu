@@ -135,13 +135,14 @@ The gap-crossing seasonal export writes this schema directly. Additional metadat
 
 | Parameter | Default | Valid values |
 | --- | --- | --- |
+| `depth_varying_n` | `True` | `True` scales Manning's n with depth as below; `False` keeps each land cover's n at every depth. Read by `arc.pipeline` (legacy ARC always scales). |
 | `k_decay` | `6.0` | Finite and positive (inverse meters). |
 | `shallow_factor` | `2.0` | Finite and >= 1. |
 | `deep_factor` | `1.0` | Finite and in (0, 1]. |
 
 ```text
 n_adjusted = n * (deep_factor + (shallow_factor - deep_factor)
-                  * exp(-k_decay * max(depth_m, 0)))
+                  / (1 + k_decay * max(depth_m, 0)))
 ```
 
 The factors multiply the baseline Manning's n at zero wet depth and in the

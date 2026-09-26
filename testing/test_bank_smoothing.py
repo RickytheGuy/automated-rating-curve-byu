@@ -59,9 +59,9 @@ def test_outlying_widths_are_rebuilt_at_the_reach_median() -> None:
     assert (filtered[0].left, filtered[0].right) == pytest.approx((10.0, 10.0))
 
 
-def test_a_median_a_cross_section_can_t_hold_is_widened_a_spacing_at_a_time() -> None:
-    """The median is 10 m, but a cross section with 8 m spacing can't make a channel between one and two spacings
-    wide, so it is rebuilt 18 m wide, still within the 75th percentile, 20 m."""
+def test_a_median_between_one_and_two_spacings_is_rebuilt_as_it_is() -> None:
+    """The median is 10 m, on a cross section with 8 m spacing. Legacy's bank indices couldn't make a channel that
+    wide, and widened it a cell at a time."""
     sections, banks = map(list, zip(*(section_with_banks(w) for w in [10.0, 10.0, 10.0, 20.0])))
     wide = flat_section(spacing=8.0)
     sections.append(wide)
@@ -70,24 +70,26 @@ def test_a_median_a_cross_section_can_t_hold_is_widened_a_spacing_at_a_time() ->
     filtered, widths = filter_reach_widths(sections, banks)
 
     assert widths == ReachWidths(10.0, 10.0, 20.0)
-    assert filtered[4].top_width == pytest.approx(18.0)
-    assert filtered[4].valid and not filtered[4].single_cell
+    assert (filtered[4].left, filtered[4].right) == pytest.approx((5.0, 5.0))
+    assert filtered[4].valid and filtered[4].method == "target_width"
 
 
-def test_a_channel_that_can_t_be_rebuilt_within_the_75th_percentile_becomes_a_single_cell() -> None:
+def test_a_median_wider_than_a_cross_section_holds_is_as_wide_as_it_can_be() -> None:
+    """With walls a metre and two metres either side of the stream cell, a 10 m median makes a channel 3 m wide."""
     sections, banks = map(list, zip(*(section_with_banks(w) for w in [10.0, 10.0, 10.0, 12.0])))
-    wide = flat_section(spacing=8.0)
-    sections.append(wide)
-    banks.append(banks_for_width(wide, 40.0))
+    walled = flat_section()
+    walled.elevations[:49] = walled.elevations[53:] = 9999.0
+    sections.append(walled)
+    banks.append(Banks("width_to_depth_ratio", 1.0, 1.0, BED, BED, False, True))
 
-    filtered, widths = filter_reach_widths(sections, banks)
+    filtered, _ = filter_reach_widths(sections, banks)
 
-    assert widths.q75 == pytest.approx(12.0)
-    assert filtered[4] == single_cell_banks(wide)
+    assert (filtered[4].left, filtered[4].right) == pytest.approx((1.0, 2.0))
+    assert filtered[4].valid
 
 
-def test_a_channel_that_can_t_be_a_single_cell_either_is_left_alone() -> None:
-    """With no ordinate on the raster on one side of the stream cell, a single-cell channel isn't valid."""
+def test_a_channel_that_can_t_be_rebuilt_is_left_alone() -> None:
+    """With no ordinate on the raster on one side of the stream cell, no channel there is valid."""
     sections, banks = map(list, zip(*(section_with_banks(w) for w in [10.0, 10.0, 10.0, 12.0])))
     walled = flat_section(spacing=8.0)
     walled.elevations[:50] = 9999.0
@@ -109,7 +111,7 @@ def test_cross_sections_without_valid_banks_get_the_median_width() -> None:
 
     assert widths.median == pytest.approx(12.0)
     assert filtered[3].valid and filtered[3].top_width == pytest.approx(12.0)
-    assert filtered[4] == NO_BANKS  # 12 m is between one and two of its spacings
+    assert filtered[4].valid and filtered[4].top_width == pytest.approx(12.0)  # one and a half of its spacings
 
 
 def test_a_reach_without_valid_banks_is_left_alone() -> None:
@@ -118,11 +120,13 @@ def test_a_reach_without_valid_banks_is_left_alone() -> None:
     assert filter_reach_widths(sections, [NO_BANKS, NO_BANKS]) == ([NO_BANKS, NO_BANKS], None)
 
 
-def test_a_single_cell_channel_is_two_spacings_wide() -> None:
-    """Its banks are the ordinates either side, where legacy counted one spacing."""
-    xs = flat_section(spacing=10.0)
+def test_a_single_cell_channel_is_one_spacing_wide() -> None:
+    """The stream cell's own width, as legacy counted it, so a reach of them has a median of one spacing."""
+    sections = [flat_section(spacing=10.0) for _ in range(4)]
+    banks = [single_cell_banks(xs) for xs in sections]
 
-    assert single_cell_banks(xs).top_width == pytest.approx(20.0)
+    assert banks[0].top_width == pytest.approx(10.0)
+    assert filter_reach_widths(sections, banks)[1] == ReachWidths(10.0, 10.0, 10.0)
 
 
 # --- Observations -------------------------------------------------------------------------------------------------
@@ -232,6 +236,28 @@ def test_a_reach_whose_neighbours_have_no_cross_sections_is_turned_by_its_end_ob
 
     assert order.tolist() == list(range(30))
     np.testing.assert_allclose(stations, 10.0 * np.arange(30))
+
+
+def test_a_reach_is_turned_by_the_observations_nearest_its_ends() -> None:
+    """Its high end's last dozen cross sections have no observation (no valid banks there), which legacy's ten at
+    each end didn't allow for: it left the reach running uphill. The ten observations nearest each end still say
+    which end is higher."""
+    # Given from the high end, so the stations start at the low end and the reach has to be turned round
+    rows, cols = np.zeros(40, dtype=np.int64), np.arange(39, -1, -1)
+    observations = 95.0 + 10.0 * cols / 39.0
+    observations[cols >= 28] = np.nan
+    network = line_graph(1, 2)
+    cells = {1: (rows, cols)}
+
+    order, stations = order_reach(network, 1, rows, cols, 10.0, 10.0, cells, observations)
+
+    assert order.tolist() == list(range(40))  # from column 39 down to column 0
+    np.testing.assert_allclose(stations, 10.0 * np.arange(40))
+    projection = np.argsort(cols, kind="stable")
+    legacy_order, _ = legacy._order_reach_stream_cells_from_network(
+        network, 1, [{"row": int(r), "col": int(c)} for r, c in zip(rows, cols)], {}, projection, observations,
+        10.0, 10.0)
+    assert cols[legacy_order].tolist() == list(range(40))  # legacy's, uphill
 
 
 # --- The network --------------------------------------------------------------------------------------------------
@@ -508,13 +534,16 @@ def test_a_reach_with_cross_sections_must_be_in_the_network() -> None:
         smooth_bank_elevations(network, reaches, 10.0, 10.0)
 
 
-def test_smoothing_needs_a_bank_elevation_somewhere() -> None:
+def test_without_an_observation_anywhere_no_reach_gets_a_bank_elevation() -> None:
+    """As legacy, whose network estimate came back empty, so that it dropped every reach. What to do with that is up
+    to the caller: the pipeline drops them only with bank elevations, which is where they're needed."""
     network, reaches = small_network()
     for reach, sections in reaches.items():
         reaches[reach] = sections._replace(banks=[NO_BANKS] * len(sections.banks))
 
-    with pytest.raises(ValueError, match="No reach has a bank elevation"):
-        smooth_bank_elevations(network, reaches, 10.0, 10.0)
+    smoothed = smooth_bank_elevations(network, reaches, 10.0, 10.0)
+
+    assert all(np.isnan(result.bank_elevations).all() for result in smoothed.values())
 
 
 # --- Speed --------------------------------------------------------------------------------------------------------
