@@ -9,9 +9,10 @@ import pytest
 
 from arc import Automated_Rating_Curve_Generator as legacy
 from arc.bathymetry import Banks, banks_for_width, single_cell_banks
-from arc.bathymetry.smoothing import (MIN_GRADE, ReachSections, ReachWidths, filter_reach_widths,
-                                      network_outlet_elevations, order_reach, reach_bank_observations,
-                                      reach_bank_surface, reach_baseline, reach_network, smooth_bank_elevations)
+from arc.bathymetry.smoothing import (BANK_HEIGHT_QUANTILE, BANK_HEIGHT_WINDOW, METHODS, MIN_GRADE, ReachSections,
+                                      ReachWidths, falling_fit, filter_reach_widths, network_outlet_elevations,
+                                      order_reach, reach_bank_levels, reach_bank_observations, reach_bank_surface,
+                                      reach_baseline, reach_network, smooth_bank_elevations)
 from arc.xsection.xsection import XSection
 
 BED = 100.0
@@ -458,6 +459,180 @@ def test_a_reach_of_one_cross_section_is_all_outlet() -> None:
     assert baseline.tolist() == [90.0] and fractions.tolist() == [1.0]
 
 
+# --- The bank level: the water surface plus the banks' height -----------------------------------------------------
+
+
+def reference_falling_fit(values) -> np.ndarray:
+    """Pool adjacent violators the slow way: merge the first rising pair of runs at their mean, and start again."""
+    runs = [[float(v)] for v in values]
+    merged = True
+    while merged:
+        merged = False
+        for k in range(len(runs) - 1):
+            if np.mean(runs[k]) < np.mean(runs[k + 1]):
+                runs[k:k + 2] = [runs[k] + runs[k + 1]]
+                merged = True
+                break
+    return np.concatenate([[np.mean(run)] * len(run) for run in runs])
+
+
+def test_the_falling_fit_pools_each_rise_at_its_mean() -> None:
+    np.testing.assert_allclose(falling_fit([5.0, 3.0, 4.0, 2.0, 6.0, 1.0]), [5.0, 3.75, 3.75, 3.75, 3.75, 1.0])
+    np.testing.assert_array_equal(falling_fit([3.0, 2.0, 2.0, 1.0]), [3.0, 2.0, 2.0, 1.0])
+
+
+def test_the_falling_fit_is_the_least_squares_sequence_that_never_rises() -> None:
+    rng = np.random.default_rng(0)
+    for _ in range(300):
+        n = int(rng.integers(1, 40))
+        values = rng.normal(0.0, 1.0, n) - rng.uniform(0.0, 0.2) * np.arange(n)
+
+        fitted = falling_fit(values)
+
+        np.testing.assert_allclose(fitted, reference_falling_fit(values), rtol=0.0, atol=1e-12)
+        assert np.all(np.diff(fitted) <= 1e-12)
+
+
+def test_the_falling_fit_leaves_nan_out() -> None:
+    np.testing.assert_allclose(falling_fit([3.0, math.nan, 5.0, 1.0]), [4.0, math.nan, 4.0, 1.0])
+
+
+def test_the_bank_height_is_the_10th_percentile_within_500_m() -> None:
+    assert (BANK_HEIGHT_QUANTILE, BANK_HEIGHT_WINDOW) == (0.1, 500.0)
+    assert METHODS[0] == "water_plus_height"
+
+
+def test_a_steady_reach_s_bank_elevation_is_its_water_plus_its_banks_height() -> None:
+    stations = 30.0 * np.arange(100)
+    thalwegs = 100.0 - 0.001 * stations
+
+    bank = reach_bank_levels(thalwegs, thalwegs + 1.5, stations, math.nan)
+
+    np.testing.assert_allclose(bank, thalwegs + 1.5, atol=1e-9)
+
+
+def test_the_height_comes_from_the_banks_nearby() -> None:
+    """Banks 1 m above the water for the first kilometre and 2 m for the second: at each end, only its own are
+    within 500 m."""
+    stations = 10.0 * np.arange(201)
+    thalwegs = 103.0 - 0.0015 * stations
+    heights = np.where(stations < 1000.0, 1.0, 2.0)
+
+    bank = reach_bank_levels(thalwegs, thalwegs + heights, stations, math.nan)
+
+    assert bank[0] == pytest.approx(thalwegs[0] + 1.0)
+    assert bank[-1] == pytest.approx(thalwegs[-1] + 2.0)
+
+
+def test_the_height_is_a_low_percentile_of_the_banks() -> None:
+    """Heights of 1 to 10 m in turn, all within 500 m of each other: their 10th percentile."""
+    stations = 10.0 * np.arange(50)
+    thalwegs = 100.0 - 0.01 * stations
+    heights = 1.0 + np.arange(50) % 10
+
+    bank = reach_bank_levels(thalwegs, thalwegs + heights, stations, math.nan)
+
+    np.testing.assert_allclose(bank - thalwegs, np.quantile(heights, 0.1), atol=1e-9)
+
+
+def test_a_reach_that_runs_mild_then_steep_keeps_its_banks_above_the_water() -> None:
+    """Legacy's straight line to the outlet passed under the whole mild stretch (BS2)."""
+    stations = 30.0 * np.arange(300)
+    thalwegs = np.where(stations < 6000.0, 165.0 - 0.0001 * stations, 164.4 - 8.0 * (stations - 6000.0) / 3000.0)
+
+    bank = reach_bank_levels(thalwegs, thalwegs + 1.5, stations, math.nan)
+
+    np.testing.assert_allclose(bank, thalwegs + 1.5, atol=1e-9)
+
+
+def test_the_bank_elevation_never_rises_downstream_or_goes_below_the_stream_cell() -> None:
+    """A stream cell 2 m above its neighbours, as a bridge in the DEM: the water surface passes under it, and the
+    bank elevation stops at the stream cell."""
+    stations = 10.0 * np.arange(50)
+    thalwegs = 100.0 - 0.001 * stations
+    thalwegs[25] += 2.0
+
+    bank = reach_bank_levels(thalwegs, thalwegs + 0.5, stations, math.nan)
+
+    assert np.all(bank >= thalwegs)
+    assert bank[25] == thalwegs[25]
+    assert np.all(np.diff(np.delete(bank, 25)) <= 1e-12)
+
+
+def test_observations_at_or_below_the_stream_cell_are_left_out() -> None:
+    stations = 10.0 * np.arange(40)
+    thalwegs = 100.0 - 0.01 * stations
+
+    bank = reach_bank_levels(thalwegs, thalwegs + np.where(np.arange(40) % 2, -0.5, 1.0), stations, math.nan)
+
+    np.testing.assert_allclose(bank, thalwegs + 1.0, atol=1e-9)
+
+
+def test_a_reach_without_observations_takes_the_fallback_height() -> None:
+    stations = 10.0 * np.arange(40)
+    thalwegs = 100.0 - 0.01 * stations
+
+    np.testing.assert_allclose(reach_bank_levels(thalwegs, np.full(40, math.nan), stations, 0.8), thalwegs + 0.8)
+    assert np.isnan(reach_bank_levels(thalwegs, np.full(40, math.nan), stations, math.nan)).all()
+
+
+def made_up_reach(thalwegs, observations, cell=30.0, phantom=False):
+    """A reach of cross sections one cell apart along a row, flowing into a reach of one cross section without an
+    observation of its own (as below the Du Page reach), and with phantom an inflow with no cross sections."""
+    count = len(thalwegs)
+    network = line_graph(1, 2, lengths=[count * cell, cell])
+    if phantom:
+        network.add_node(0, length=2000.0)
+        network.add_edge(0, 1)
+
+    def section(z):
+        elevations = np.full(9, z + 5.0)
+        elevations[4] = z
+        return XSection(elevations, np.full(9, 0.035), cell)
+
+    def banks(z):
+        return Banks("test", 30.0, 30.0, z, z, False, True)
+    last = float(thalwegs[-1]) - 0.01
+    reaches = {1: ReachSections(np.zeros(count, np.int64), np.arange(count), [section(z) for z in thalwegs],
+                                [banks(z) for z in observations]),
+               2: ReachSections(np.zeros(1, np.int64), np.array([count]), [section(last)], [banks(last)])}
+    return network, reaches
+
+
+def test_an_inflow_without_cross_sections_doesn_t_cap_the_reach() -> None:
+    """Legacy's network gave the inflow the reach's own lowest observation plus the minimum grade, and that held the
+    reach's bank elevation down to about its outlet's all the way up (BS2)."""
+    thalwegs = 100.0 - 0.001 * 30.0 * np.arange(300)
+    network, reaches = made_up_reach(thalwegs, thalwegs + 1.5, phantom=True)
+
+    new = smooth_bank_elevations(network, reaches, 30.0, 30.0)[1]
+    old = smooth_bank_elevations(network, reaches, 30.0, 30.0, method="legacy")[1]
+
+    np.testing.assert_allclose(new.bank_elevations, thalwegs + 1.5, atol=1e-9)
+    assert old.bank_elevations[0] < thalwegs[0] - 5.0
+    assert not new.anchors.any()
+
+
+def test_the_site_s_height_fills_in_a_reach_without_observations() -> None:
+    """Reach 1's banks are 1.2 m above its water where they're above it at all; reach 3, flat, has no banks."""
+    thalwegs = 100.0 - 0.001 * 30.0 * np.arange(60)
+    network, reaches = made_up_reach(thalwegs, np.r_[thalwegs[:30] + 1.2, thalwegs[30:] - 1.0])
+    flat = XSection(np.r_[np.full(4, 55.0), 50.0, np.full(4, 55.0)], np.full(9, 0.035), 30.0)
+    reaches[3] = ReachSections(np.full(10, 5, np.int64), np.arange(10), [flat] * 10, [NO_BANKS] * 10)
+    network.add_node(3, length=300.0)
+
+    smoothed = smooth_bank_elevations(network, reaches, 30.0, 30.0)
+
+    np.testing.assert_allclose(smoothed[3].bank_elevations, 51.2, atol=1e-9)
+
+
+def test_an_unknown_method_raises() -> None:
+    network, reaches = made_up_reach(np.full(5, 100.0), np.full(5, 101.0))
+
+    with pytest.raises(ValueError, match="method must be one of"):
+        smooth_bank_elevations(network, reaches, 30.0, 30.0, method="lowest")
+
+
 # --- Everything ---------------------------------------------------------------------------------------------------
 
 
@@ -486,10 +661,10 @@ def small_network():
     return network, reaches
 
 
-def test_bank_elevations_fall_along_the_network() -> None:
+def test_legacy_s_bank_elevations_fall_along_the_network() -> None:
     network, reaches = small_network()
 
-    smoothed = smooth_bank_elevations(network, reaches, 10.0, 10.0)
+    smoothed = smooth_bank_elevations(network, reaches, 10.0, 10.0, method="legacy")
 
     for reach, result in smoothed.items():
         ordered = result.bank_elevations[result.order]

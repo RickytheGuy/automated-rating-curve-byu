@@ -10,7 +10,7 @@ upstream to downstream in the order the bank smoothing put them in (smooth_bank_
    (fill_reach_depths).
 2. The bed, each cross section's reference level less its depth, is smoothed with a running median of five cross
    sections, two either side and fewer at a reach's ends. With the bed cap on it then rises or falls no more than
-   1 cm per metre along the stream, starting within that of the lowest bed flowing into the reach
+   MAX_BED_GRADE metres per metre along the stream, starting within that of the lowest bed flowing into the reach
    (smooth_reach_bed). The depth to carve is the reference level's height above the smoothed bed, or 0 where the
    bed is above it.
 
@@ -19,11 +19,16 @@ as for bathymetry_depth and carve_channel.
 
 The bed cap
 -----------
-It keeps the bed from following the banks down a reach falling faster than 1%, so the channel fills in: on a reach
-of 10 m cells falling 2%, a 1 m channel is 0.2 m deep after 100 m and gone after 120 m. At a confluence it keeps a
-reach's first bed near the lowest bed flowing in, so where the banks drop 3 m, the reach below has no channel for
-its first 210 m. max_bed_grade=None turns it off, along the reaches and across the confluences, leaving the running
-median.
+The cap is MAX_SLOPE, 0.5 m per metre, the steepest stream slope ARC allows: a bed may be as steep as a stream.
+Legacy ARC's was 1 cm per metre (LEGACY_BED_GRADE), which kept the bed from following the banks down any reach
+falling faster than 1%, so the channel filled in: on a reach of 10 m cells falling 2%, a 1 m channel was 0.2 m deep
+after 100 m and gone after 120 m. At a confluence it kept a reach's first bed near the lowest bed flowing in, so
+where the banks dropped 3 m the reach below had no channel for its first 210 m, and on the Du Page River site, below
+a bed 10 m higher (with legacy's bank smoothing), for its first 880 m. The other way, it held a reach's bed down near a
+lower bed flowing in, carving the channel deeper. On the 51 FIM sites a cap of 0.5 changes the carved depth at 9% of
+the cross sections (2% with legacy's bank smoothing, whose network step kept each reach's banks below those flowing
+in), as turning it off does. max_bed_grade=None turns it off, along the reaches and across the confluences, leaving
+the running median; max_bed_grade=LEGACY_BED_GRADE is legacy's.
 
 The running median has fewer cross sections to one side at a reach's ends, so on a sloping bed it comes out low at
 the upstream end and high at the downstream end: on that 2% reach, the first cross section is 0.2 m deeper and the
@@ -41,7 +46,7 @@ Errors in the legacy code, not repeated here
   depth below the stream cell, so the bed smoothed wasn't the bed carved. Where the stream cells rise and fall more
   than the smoothed banks, as they usually do, the carved bed kept all of that. Here the bed is the stream cell's
   elevation less the depth.
-- A reach's first bed was held to the lowest bed flowing into it by 1 cm per metre of its own station, which is
+- A reach's first bed was held to the lowest bed flowing into it by the cap per metre of its own station, which is
   always 0, so by legacy's shortest step of 0.1 m: to within 1 mm. Here it's per metre from the cross section that
   bed came from.
 - A missing bed (a NaN bank elevation or stream cell) made the running median NaN within two cross sections of it,
@@ -65,10 +70,12 @@ from numba import njit
 
 from arc.bathymetry.channel import MAX_DEPTH
 from arc.bathymetry.smoothing import ReachSections, SmoothedReach
+from arc.xsection.slope import MAX_SLOPE
 
 DEFAULT_DEPTH = 0.5  # the depth filled in with none before it to take
 MEDIAN_WINDOW = 5  # how many cross sections the running median of the bed takes in
-MAX_BED_GRADE = 0.01  # the bed cap: how much the bed may rise or fall per metre along the stream
+MAX_BED_GRADE = MAX_SLOPE  # the bed cap: how much the bed may rise or fall per metre along the stream
+LEGACY_BED_GRADE = 0.01  # legacy ARC's bed cap
 SHORTEST_STEP = 0.1  # metres: the cap allows at least this much distance between cross sections
 
 

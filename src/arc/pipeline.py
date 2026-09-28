@@ -604,9 +604,9 @@ def unresolved_banks(xs: XSection, target_width: float) -> Banks:
 def apply_bathymetry(configs: Configs, grid: Grid, cells: Cells, sections: list, network, slopes, baseflow,
                      target_depth, target_width) -> np.ndarray:
     """Smooth the banks, find, smooth and carve each channel, and return the filled bathymetry raster. With
-    Bathy_Use_Banks, the sections of a reach given no bank elevation become unusable, as legacy dropped them. A
-    channel whose banks are still unresolved after the width filter is carved at its width prior, or one cell wide
-    (unresolved_banks)."""
+    Bathy_Use_Banks, the sections of a reach given no bank elevation become unusable, as legacy dropped them (which
+    the bank smoothing now does only where the site has no bank observation at all). A channel whose banks are still
+    unresolved after the width filter is carved at its width prior, or one cell wide (unresolved_banks)."""
     if network is None:
         raise ValueError("Bathymetry needs the stream network, from StrmShp_File, reach_id and downstream_reach_id.")
     use_banks = configs.bathy_use_banks

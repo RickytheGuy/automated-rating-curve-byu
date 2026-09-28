@@ -64,8 +64,9 @@ class Configs:
     # Bathymetry configuration
     bathy_trap_h: float = 0.2
     bathy_use_banks: bool = False
-    # Hold the smoothed channel bed to rising or falling 1 cm per metre along the stream, as legacy ARC did
-    # (arc.bathymetry.smooth_channel_depths' max_bed_grade, MAX_BED_GRADE when on and None when off)
+    # Hold the smoothed channel bed to rising or falling no more than MAX_SLOPE (0.5 m) per metre along the stream,
+    # where legacy ARC held it to 1 cm (arc.bathymetry.smooth_channel_depths' max_bed_grade, MAX_BED_GRADE when on
+    # and None when off)
     bathy_bed_cap: bool = True
     findbanksbasedonlandcover: bool = False
 

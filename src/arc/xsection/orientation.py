@@ -6,6 +6,15 @@ section runs across it. Legacy ARC then tried turning the cross section a little
 Degree_Interval) and kept the direction where the water surface 0.5 m above the stream cell was narrowest, since a
 cross section at right angles to a channel crosses it by the shortest way.
 
+Here the water surface is 5 m above the stream cell (TEST_DEPTH; legacy's is LEGACY_TEST_DEPTH). On the 30 m DEMs
+ARC runs on, water 0.5 m deep is still inside a channel one or two cells wide, whose rasterised edges decide its
+width, so the search chose by that. On made-up valleys with a 36 m channel on the FIM sites' cells, it turned cross
+sections about 20 degrees from square to both the valley and the channel, where not searching was half a degree
+off; from 2 to 3 m deep the water spans the floodplain and the search finds the valley, to 1.4 degrees at 5 m. On
+the 51 FIM sites the 0.5 m search made about 45% of neighbouring cross sections cross within the flood's reach (under
+a fifth without the search), and put 15% of them on a row, column or cell diagonal; at 5 m, about 38% and 8.5%. The
+flood maps were the same either way (the user chose 5 m on 2026-09-26).
+
 Errors in the legacy code, not repeated here
 --------------------------------------------
 - The square of cells the direction came from ran from Gen_Dir_Dist before the cell to one less than Gen_Dir_Dist
@@ -45,7 +54,8 @@ from arc.hydraulics import top_widths
 from arc.xsection.sampling import OFF_RASTER_ELEVATION, sample_cross_section, sample_elevations
 from arc.xsection.xsection import XSection
 
-TEST_DEPTH = 0.5  # how far above the stream cell the search measures the water's width
+TEST_DEPTH = 5.0  # how far above the stream cell the search measures the water's width
+LEGACY_TEST_DEPTH = 0.5  # legacy ARC's
 _SAME_DIRECTION = 1e-12  # radians
 
 
@@ -176,7 +186,7 @@ def _narrowest_direction(dem, row, col, stream_direction, cross_section_length, 
 def narrowest_direction(dem: np.ndarray, row: int, col: int, stream_direction: float, cross_section_length: float,
                         dx: float, dy: float, offsets: np.ndarray, test_depth: float = TEST_DEPTH) -> float:
     """The stream direction, turned by one of the offsets (see angle_offsets), whose cross section is narrowest
-    test_depth above the stream cell (legacy get_best_xsection_angle).
+    test_depth above the stream cell (legacy get_best_xsection_angle, whose depth was LEGACY_TEST_DEPTH).
 
     The arguments are sample_cross_section's. Each side's width is compared only as far out as every direction's
     cross section reaches on that side (the raster's edge, or the first NaN, can be nearer than its end). Of

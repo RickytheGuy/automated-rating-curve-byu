@@ -534,21 +534,44 @@ def write_channel_and_plateau(folder: Path) -> dict:
 
 
 @pytest.mark.parametrize("use_banks", [True, False])
-def test_a_reach_without_a_bank_elevation_is_dropped_with_bank_elevations(tmp_path: Path, use_banks: bool) -> None:
-    """On the plateau no bank stands above the stream, so the network gives its reach no bank elevation. Legacy then
-    dropped the reach from the bathymetry and the rating curves; here only with Bathy_Use_Banks, which needs it."""
+def test_a_reach_without_banks_of_its_own_takes_the_site_s_bank_height(tmp_path: Path, use_banks: bool) -> None:
+    """On the plateau no bank stands above the stream. Legacy's network then gave its reach no bank elevation, and
+    it dropped the reach from the bathymetry and the rating curves. Here it takes the site's bank height, from the
+    channel's reaches, and stays."""
     inputs = {**write_channel_and_plateau(tmp_path), "BATHY_Out_File": str(tmp_path / "bathy.tif"),
               "Bathy_Use_Banks": use_banks, "AROutFLOOD": str(tmp_path / "flood.tif")}
     results = pipeline.run(Configs.from_mapping(inputs), quiet=True)
-    plateau = results.cells.comids == 31
+    plateau = np.flatnonzero(results.cells.comids == 31)
     flood = Raster(tmp_path / "flood.tif").read_array()
 
-    assert all(results.sections[k].usable for k in np.flatnonzero(~plateau))
-    assert all(results.sections[k].usable != use_banks for k in np.flatnonzero(plateau))
-    assert np.isnan(results.curves.increments[plateau]).all() == use_banks
-    assert np.isnan(results.bathymetry[ROWS:]).all() == use_banks
-    assert (flood[ROWS + CENTER_ROW, 20:100] == 0).all() == use_banks
+    assert all(section.usable for section in results.sections if section is not None)
+    heights = [results.sections[k].bank_elevation - (BED + 10.0) for k in plateau]
+    np.testing.assert_allclose(heights, heights[0])
+    assert heights[0] > 0.0
+    assert not np.isnan(results.curves.increments[plateau]).all()
+    assert (flood[ROWS + CENTER_ROW, 20:100] == pipeline.FLOODED_CELL).all()
     assert (flood[CENTER_ROW, 20:220] == pipeline.FLOODED_CELL).all()
+
+
+@pytest.mark.parametrize("use_banks", [True, False])
+def test_without_a_bank_anywhere_the_reach_is_dropped_with_bank_elevations(tmp_path: Path, use_banks: bool) -> None:
+    """The plateau alone: no bank stands above the stream anywhere, so there's no bank height to take, and as legacy
+    the reach is dropped from the bathymetry and the rating curves, but only with Bathy_Use_Banks, which needs it."""
+    srs, geotransform = _projected()
+    streams = np.zeros((ROWS, COLS), dtype=np.int32)
+    streams[CENTER_ROW, 20:100] = 31
+    reaches = {31: {"start": (CENTER_ROW, 20), "end": (CENTER_ROW, 99), "downstream": -1, "baseflow": 2.0,
+                    "q_max": 15.0}}
+    inputs = {**write_inputs(tmp_path, np.full((ROWS, COLS), BED), streams, srs, geotransform, reaches),
+              "BATHY_Out_File": str(tmp_path / "bathy.tif"), "Bathy_Use_Banks": use_banks,
+              "AROutFLOOD": str(tmp_path / "flood.tif")}
+    results = pipeline.run(Configs.from_mapping(inputs), quiet=True)
+    flood = Raster(tmp_path / "flood.tif").read_array()
+
+    assert all(section.usable != use_banks for section in results.sections if section is not None)
+    assert np.isnan(results.curves.increments).all() == use_banks
+    assert np.isnan(results.bathymetry).all() == use_banks
+    assert (flood[CENTER_ROW, 20:100] == 0).all() == use_banks
 
 
 @pytest.mark.parametrize("method", ["local_average", "reach_average", "local_average_corrected", "end_points"])
@@ -749,7 +772,9 @@ def test_a_real_site_s_rating_curves_are_physically_consistent(tmp_path: Path, s
 @pytest.mark.parametrize("site", REAL_SITES)
 def test_a_real_site_agrees_with_legacy_where_the_methods_don_t_differ(tmp_path: Path, site: str) -> None:
     """The cells, their DEM elevations and baseflows are legacy's, and both carry about the maximum flow at the top
-    of most rating curves. Everything else legitimately differs (see arc.pipeline and the modules' notes)."""
+    of most rating curves (at Salt Creek legacy's 73% and the new code's 93%, where a channel filled to the new bank
+    elevation spills before it; 92% and 99% at Blue River). Everything else legitimately differs (see arc.pipeline
+    and the modules' notes)."""
     inputs = real_inputs(site, tmp_path)
     legacy = {**inputs, "Print_VDT_Database": str(tmp_path / "legacy_vdt.parquet"),
               "BATHY_Out_File": str(tmp_path / "legacy_bathy.tif"), "AROutBATHY": str(tmp_path / "legacy_bathy.tif"),
@@ -765,5 +790,8 @@ def test_a_real_site_agrees_with_legacy_where_the_methods_don_t_differ(tmp_path:
     assert len(merged) > 0.9 * len(old)
     assert (merged["Elev_legacy"] == merged["Elev_new"]).all()
     assert (merged["QBaseflow_legacy"] == merged["QBaseflow_new"]).all()
-    close = np.abs(merged[f"q_{n}_legacy"] / merged[f"q_{n}_new"] - 1.0) < 0.02
-    assert close.mean() > 0.7
+    flows = pd.read_csv(inputs["Flow_File"])
+    q_max = dict(zip(flows[inputs["Flow_File_ID"]], flows[inputs["Flow_File_QMax"]]))
+    for vdt, share in ((old, 0.6), (new, 0.85)):
+        at_top = vdt[f"q_{n}"] / vdt["COMID"].map(q_max)
+        assert (np.abs(at_top - 1.0) < 0.02).mean() > share

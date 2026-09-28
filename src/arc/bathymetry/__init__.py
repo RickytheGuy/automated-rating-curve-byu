@@ -20,8 +20,8 @@ the functions they call), for XSection and arc.hydraulics. A cross section goes 
 
 bank_elevation is None without Bathy_Use_Banks. With it, it is the cross section's smoothed bank elevation, the level
 to carve below. smooth_bank_elevations filters each reach's widths, which can change its banks, and
-smooth_channel_depths fills in each reach's depths and smooths its bed (with or without legacy's bed cap, Configs'
-bathy_bed_cap). fill_bathymetry_gaps fills the gaps the cross sections leave in the raster. The notes in their modules
+smooth_channel_depths fills in each reach's depths and smooths its bed (with or without the bed cap, Configs'
+bathy_bed_cap, which holds the bed to MAX_SLOPE per metre where legacy's held it to 1 cm). fill_bathymetry_gaps fills the gaps the cross sections leave in the raster. The notes in their modules
 list how they differ from legacy ARC.
 
 Banks are distances from the stream cell, not ordinate indices, so a bank can fall between ordinates and a channel's

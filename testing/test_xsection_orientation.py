@@ -9,7 +9,7 @@ import pytest
 from arc.Automated_Rating_Curve_Generator import get_stream_direction_information
 from arc.cross_section import CrossSection
 from arc.hydraulics import top_widths
-from arc.xsection.orientation import (TEST_DEPTH, angle_offsets, downhill_stream_direction, narrowest_cross_section,
+from arc.xsection.orientation import (LEGACY_TEST_DEPTH, TEST_DEPTH, angle_offsets, downhill_stream_direction, narrowest_cross_section,
                                       narrowest_direction, stream_direction)
 from arc.xsection.sampling import sample_cross_section, sample_elevations
 
@@ -226,11 +226,13 @@ def test_the_search_matches_legacy_along_rows_and_columns() -> None:
     old.test_angles_and_reset_cross_section(100, 100)
 
     direction, xs = narrowest_cross_section(dem, np.ones_like(dem), 100, 100, 0.0, 1000.0, CELL, CELL,
-                                            angle_offsets(180, 90))
-    left, right = top_widths(xs.elevations, xs.ordinate_distance, xs.elevations[xs.elevations.size // 2] + TEST_DEPTH)
+                                            angle_offsets(180, 90), test_depth=LEGACY_TEST_DEPTH)
+    left, right = top_widths(xs.elevations, xs.ordinate_distance,
+                             xs.elevations[xs.elevations.size // 2] + LEGACY_TEST_DEPTH)
 
     assert axis_difference(direction - math.pi / 2, old.d_xs_direction) == pytest.approx(0.0, abs=1e-12)
-    assert left + right == pytest.approx(old.calculate_top_width_of_wse(old.get_thalweg() + TEST_DEPTH), abs=1e-3)
+    assert left + right == pytest.approx(old.calculate_top_width_of_wse(old.get_thalweg() + LEGACY_TEST_DEPTH),
+                                         abs=1e-3)
     assert left + right == pytest.approx(2.0 * 0.5 / 0.2, rel=1e-12)
 
 
@@ -244,11 +246,12 @@ def test_equally_narrow_directions_keep_the_first() -> None:
 
 
 def uncapped_choice(dem, row, col, start, length, offsets) -> int:
-    """Which offset legacy's rule would pick: the smallest top width, however far each cross section reaches."""
+    """Which offset legacy's rule would pick: the smallest top width 0.5 m up, however far each cross section
+    reaches."""
     widths = []
     for offset in offsets:
         elevations, spacing = sample_elevations(dem, row, col, start + offset, length, CELL, CELL)
-        left, right = top_widths(elevations, spacing, elevations[elevations.size // 2] + TEST_DEPTH)
+        left, right = top_widths(elevations, spacing, elevations[elevations.size // 2] + LEGACY_TEST_DEPTH)
         widths.append(left + right)
     return int(np.argmin(widths))
 
@@ -260,7 +263,7 @@ def test_water_reaching_every_cross_section_s_ends_doesnt_choose_the_direction()
     dem[100, 100] = 99.8
     offsets = angle_offsets(90, 45)
 
-    assert narrowest_direction(dem, 100, 100, 0.0, 100.0, CELL, CELL, offsets) == 0.0
+    assert narrowest_direction(dem, 100, 100, 0.0, 100.0, CELL, CELL, offsets, test_depth=LEGACY_TEST_DEPTH) == 0.0
     assert uncapped_choice(dem, 100, 100, 0.0, 100.0, offsets) == 1
 
 
@@ -282,7 +285,8 @@ def test_a_side_reaching_the_raster_s_edge_leaves_the_other_side_to_choose() -> 
     offsets = angle_offsets(40, 5)
     start = math.radians(20.0)
 
-    assert math.degrees(narrowest_direction(dem, 50, 3, start, 600.0, CELL, CELL, offsets)) == pytest.approx(30.0)
+    assert math.degrees(narrowest_direction(dem, 50, 3, start, 600.0, CELL, CELL, offsets,
+                                            test_depth=LEGACY_TEST_DEPTH)) == pytest.approx(30.0)
     assert math.degrees(start + offsets[uncapped_choice(dem, 50, 3, start, 600.0, offsets)]) == pytest.approx(40.0)
 
 
@@ -292,7 +296,8 @@ def test_water_reaching_missing_ground_counts_as_reaching_the_end() -> None:
     rows, cols = np.mgrid[0:101, 0:101]
     dem[-(cols - 50) * CELL * 0.5 + (rows - 50) * CELL * math.sqrt(0.75) > 30.0] = np.nan
 
-    direction = narrowest_direction(dem, 50, 50, math.radians(20.0), 600.0, CELL, CELL, angle_offsets(40, 5))
+    direction = narrowest_direction(dem, 50, 50, math.radians(20.0), 600.0, CELL, CELL, angle_offsets(40, 5),
+                                    test_depth=LEGACY_TEST_DEPTH)
 
     assert math.degrees(direction) == pytest.approx(30.0)
 
@@ -316,8 +321,31 @@ def test_the_width_is_compared_at_the_test_depth() -> None:
     dem = 100.0 + 0.01 * np.minimum(across, 100.0)
     start, offsets = math.radians(20.0), angle_offsets(20, 10)
 
-    assert math.degrees(narrowest_direction(dem, 100, 100, start, 600.0, CELL, CELL, offsets)) == pytest.approx(30.0)
+    assert math.degrees(narrowest_direction(dem, 100, 100, start, 600.0, CELL, CELL, offsets,
+                                            test_depth=0.5)) == pytest.approx(30.0)
     assert narrowest_direction(dem, 100, 100, start, 600.0, CELL, CELL, offsets, test_depth=1.5) == start
+
+
+def test_the_test_depth_is_5_m_where_legacy_s_was_half_a_metre() -> None:
+    assert (TEST_DEPTH, LEGACY_TEST_DEPTH) == (5.0, 0.5)
+
+
+def test_the_default_depth_finds_the_valley_where_legacy_s_found_the_channel() -> None:
+    """A V channel 1 m deep and 50 m wide at 30 degrees, down a valley whose floor is 400 m wide at 60 degrees, with
+    walls rising 10 cm a metre, all planes that linear interpolation between cells reproduces. Half a metre up the
+    water fills only the channel; 5 m up it floods the valley floor out to 240 m either side of its axis."""
+    rows, cols = np.mgrid[0:201, 0:201]
+
+    def across(angle):
+        return np.abs(-(cols - 100) * CELL * math.sin(angle) + (rows - 100) * CELL * math.cos(angle))
+    valley = 0.1 * np.maximum(across(math.radians(60.0)) - 200.0, 0.0)
+    channel = np.maximum(1.0 - across(math.radians(30.0)) / 25.0, 0.0)
+    dem = 100.0 + valley - channel
+    start, offsets = math.radians(45.0), angle_offsets(40, 5)
+
+    assert math.degrees(narrowest_direction(dem, 100, 100, start, 600.0, CELL, CELL, offsets)) == pytest.approx(60.0)
+    assert math.degrees(narrowest_direction(dem, 100, 100, start, 600.0, CELL, CELL, offsets,
+                                            test_depth=LEGACY_TEST_DEPTH)) == pytest.approx(30.0)
 
 
 def test_an_offset_beyond_a_quarter_turn_is_taken_half_a_turn_round() -> None:
@@ -379,7 +407,7 @@ def test_the_search_is_faster_than_legacy_s() -> None:
     offsets = angle_offsets(6.0, 1.0)
 
     new = _seconds_per_call(lambda: narrowest_cross_section(dem, manning_n, 600, 600, 0.7, 5000.0, CELL, CELL,
-                                                            offsets), calls=200)
+                                                            offsets, test_depth=LEGACY_TEST_DEPTH), calls=200)
     legacy = _seconds_per_call(lambda: old.test_angles_and_reset_cross_section(600, 600), calls=200)
 
     assert new < legacy

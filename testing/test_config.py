@@ -79,7 +79,8 @@ def test_text_yaml_and_mapping_inputs_build_equal_configs(tmp_path: Path) -> Non
 
 
 def test_the_bed_cap_is_on_unless_turned_off(tmp_path: Path) -> None:
-    """Bathy_Bed_Cap switches legacy's limit of 1 cm per metre on how fast the smoothed channel bed rises or falls."""
+    """Bathy_Bed_Cap switches the limit on how fast the smoothed channel bed rises or falls (MAX_SLOPE per metre;
+    legacy's was 1 cm)."""
     text_file = tmp_path / "ARC_Input_File.txt"
     text_file.write_text("DEM_File\tdem.tif\nBathy_Bed_Cap\tFalse\n", encoding="utf-8")
     yaml_file = tmp_path / "ARC_Input_File.yaml"

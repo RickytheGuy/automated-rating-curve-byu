@@ -9,8 +9,10 @@ import pytest
 
 from arc import Automated_Rating_Curve_Generator as legacy
 from arc.bathymetry import Banks
-from arc.bathymetry.bed_smoothing import fill_reach_depths, smooth_channel_depths, smooth_reach_bed
+from arc.bathymetry.bed_smoothing import (LEGACY_BED_GRADE, MAX_BED_GRADE, fill_reach_depths, smooth_channel_depths,
+                                          smooth_reach_bed)
 from arc.bathymetry.smoothing import ReachSections, SmoothedReach, order_reach
+from arc.xsection.slope import MAX_SLOPE
 from arc.xsection.xsection import XSection
 
 CELL = 10.0
@@ -48,9 +50,11 @@ def network_inputs(network, cells, banks, thalwegs=None):
 
 
 def smoothed_depths(network, cells, banks, depths, thalwegs=None, **options):
-    """smooth_channel_depths' depths and beds, back in the order of cells."""
+    """smooth_channel_depths' depths and beds, back in the order of cells, with legacy's bed cap unless told
+    otherwise, since most of these tests check against legacy's."""
     reaches, smoothed, indices = network_inputs(network, cells, banks, thalwegs)
     options.setdefault("use_banks", True)
+    options.setdefault("max_bed_grade", LEGACY_BED_GRADE)
     result = smooth_channel_depths(network, reaches, smoothed, {r: [depths[k] for k in ks] for r, ks in indices.items()},
                                    CELL, CELL, **options)
     out_depths, out_beds = np.empty(len(cells)), np.empty(len(cells))
@@ -173,12 +177,16 @@ def test_the_bed_is_the_median_of_the_five_cross_sections_around_it() -> None:
     np.testing.assert_array_equal(smoothed, [10.0, 10.5, 10.0, 11.0, 10.5, 12.0])
 
 
-def test_the_bed_cap_holds_the_bed_to_1_cm_a_metre() -> None:
-    """A 1 m channel down a reach falling 2%: capped, its bed falls 1 m per 100 m, so the channel is gone after 120 m
-    (1.2 m deep at first, from the median at the reach's end)."""
+def test_the_bed_cap_is_the_steepest_stream_slope() -> None:
+    assert MAX_BED_GRADE == MAX_SLOPE == 0.5
+
+
+def test_legacy_s_bed_cap_holds_the_bed_to_1_cm_a_metre() -> None:
+    """A 1 m channel down a reach falling 2%: capped at 1 cm a metre, its bed falls 1 m per 100 m, so the channel is
+    gone after 120 m (1.2 m deep at first, from the median at the reach's end)."""
     banks = 100.0 - 0.02 * CELL * np.arange(30)
 
-    capped = smooth_reach_bed(banks - 1.0, CELL * np.arange(30))
+    capped = smooth_reach_bed(banks - 1.0, CELL * np.arange(30), max_bed_grade=LEGACY_BED_GRADE)
     uncapped = smooth_reach_bed(banks - 1.0, CELL * np.arange(30), max_bed_grade=None)
 
     np.testing.assert_allclose((banks - capped)[[0, 5, 10, 12]], [1.2, 0.7, 0.2, 0.0], atol=1e-9)
@@ -187,21 +195,31 @@ def test_the_bed_cap_holds_the_bed_to_1_cm_a_metre() -> None:
     np.testing.assert_allclose((banks - uncapped)[[0, -1]], [1.2, 0.8], atol=1e-9)
 
 
+def test_at_the_default_cap_the_bed_follows_a_reach_falling_2_percent() -> None:
+    banks = 100.0 - 0.02 * CELL * np.arange(30)
+
+    smoothed = smooth_reach_bed(banks - 1.0, CELL * np.arange(30))
+
+    np.testing.assert_allclose(smoothed, smooth_reach_bed(banks - 1.0, CELL * np.arange(30), max_bed_grade=None))
+
+
 def test_the_cap_allows_at_least_a_tenth_of_a_metre_between_cross_sections() -> None:
-    smoothed = smooth_reach_bed([100.0, 90.0, 90.0], [0.0, 0.0, 0.0], window=1)
+    smoothed = smooth_reach_bed([100.0, 90.0, 90.0], [0.0, 0.0, 0.0], window=1, max_bed_grade=LEGACY_BED_GRADE)
 
     np.testing.assert_allclose(smoothed, [100.0, 99.999, 99.998])
 
 
 def test_the_first_bed_is_held_to_the_lowest_bed_flowing_in() -> None:
-    smoothed = smooth_reach_bed([95.0, 95.0], [0.0, 10.0], window=1, inflow_bed=98.0, inflow_distance=10.0)
+    smoothed = smooth_reach_bed([95.0, 95.0], [0.0, 10.0], window=1, inflow_bed=98.0, inflow_distance=10.0,
+                                max_bed_grade=LEGACY_BED_GRADE)
 
     np.testing.assert_allclose(smoothed, [97.9, 97.8])
 
 
 def test_a_missing_bed_is_left_out_of_the_median_and_the_cap() -> None:
     """The medians are 10.5, 10, none, 11 and 11, and the cap lets them change 0.1 m per 10 m, across the gap too."""
-    smoothed = smooth_reach_bed([10.0, 11.0, math.nan, 9.0, 13.0], [0.0, 10.0, 20.0, 30.0, 40.0])
+    smoothed = smooth_reach_bed([10.0, 11.0, math.nan, 9.0, 13.0], [0.0, 10.0, 20.0, 30.0, 40.0],
+                                max_bed_grade=LEGACY_BED_GRADE)
 
     np.testing.assert_allclose(smoothed, [10.5, 10.4, math.nan, 10.6, 10.7])
 
@@ -221,7 +239,8 @@ def test_the_bed_matches_legacy_s(monkeypatch) -> None:
         _, expected = run_legacy(monkeypatch, network, cells, banks, depths, steps=("beds",))
 
         smoothed = smooth_reach_bed(np.subtract(banks, depths)[1:n + 1], CELL * (cols - cols[0]),
-                                    inflow_bed=banks[0] - depths[0], inflow_distance=0.0)
+                                    inflow_bed=banks[0] - depths[0], inflow_distance=0.0,
+                                    max_bed_grade=LEGACY_BED_GRADE)
 
         np.testing.assert_array_equal(smoothed, expected[1:n + 1])
 
@@ -304,6 +323,16 @@ def test_where_the_banks_drop_3_m_the_capped_reach_below_starts_without_a_channe
     assert np.flatnonzero(capped[20:] > 0.0)[0] == 22
     assert np.flatnonzero(old[20:] > 0.0)[0] == 23
     np.testing.assert_allclose(uncapped[22:58], 1.0, atol=1e-9)
+
+
+def test_at_the_default_cap_the_reach_below_a_3_m_drop_has_its_channel_from_the_start() -> None:
+    network = line_graph(1, 2, 3)
+    cells = along_row([(1, 20), (2, 40)])
+    banks = 100.0 - 0.001 * CELL * np.arange(60) - np.where(np.arange(60) >= 20, 3.0, 0.0)
+
+    depths, _ = smoothed_depths(network, cells, banks, [1.0] * 60, max_bed_grade=MAX_BED_GRADE)
+
+    assert np.all(depths[20:58] > 0.9)
 
 
 def test_the_first_bed_is_held_to_the_lower_of_two_reaches_flowing_in() -> None:

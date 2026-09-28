@@ -1,9 +1,8 @@
 """Smoothing the bank elevations along the reaches of a stream network.
 
-This is legacy ARC's reach and network pass between finding each cross section's banks and working out its
-bathymetry (_smooth_reach_bank_elevations and the functions it calls). The smoothed bank elevation is the level the
-channel is carved below with Bathy_Use_Banks, the bank_elevation that bathymetry_depth and carve_channel take.
-smooth_bank_elevations does it all:
+This is the reach and network pass between finding each cross section's banks and working out its bathymetry (legacy
+ARC's _smooth_reach_bank_elevations). The smoothed bank elevation is the level the channel is carved below with
+Bathy_Use_Banks, the bank_elevation that bathymetry_depth and carve_channel take. smooth_bank_elevations does it all:
 
 1. Each reach's widths are filtered (filter_reach_widths). A valid channel narrower than the reach's 25th percentile
    width or wider than its 75th gets banks for the reach's median width instead, and so does a cross section
@@ -12,10 +11,40 @@ smooth_bank_elevations does it all:
    out those below the reach's 2nd percentile or above its 97th (reach_bank_observations). With four or more, that
    always leaves out the lowest and the highest, unless another ties with them.
 3. The reach's cross sections are put in order from upstream to downstream (order_reach).
+4. Along each reach the bank elevation is the DEM's water surface, fitted to fall downstream, plus a low percentile
+   of the observations' heights above their stream cells nearby, fitted to fall downstream again, and never below
+   the stream cell (reach_bank_levels).
+
+Step 4 replaced legacy's on 2026-09-26 (the user's choice); legacy's is method="legacy":
+
 4. Each reach's lowest observation is its bank elevation at its outlet, and the network fills in reaches without one
    and makes every outlet lower than the ones upstream of it (network_outlet_elevations).
 5. Along each reach the bank elevation falls in a straight line to its outlet, and wherever an observation is lower
    than the line it is refitted through it (reach_bank_surface).
+
+Why the bank elevation isn't legacy's any more
+---------------------------------------------
+Legacy's was a lower envelope, following a reach's lowest observations, and on the 51 FIM sites it was below the
+stream cell, under the DEM's water, at a third of the cross sections. Three things put it there. A straight line
+refitted only through observations below it can follow a reach that steepens upstream but not one that runs mild
+and then steep, under all of whose mild stretch it passes (the Du Page River site: 5.7 m under its stream cells).
+An inflow with no cross sections of its own got an outlet extrapolated up from the reach below it, that reach's own
+lowest observation plus the minimum grade, and as the reach's lowest inflow it then capped it at about that. And
+once one low observation anchored the line, everything downstream was held at or below it while the DEM's water
+went up and down. Where the channel was wide, the carve then dug the whole incised channel out below that level (the
+Flint River site: a 110 m box 8.7 m under its bank tops), and the flood maps shrank.
+
+Here the reach's shape comes from its stream cells, of which every cross section has one, and only the bank's
+height above them from the observations. The observations are high: most are single cells, whose observation is the
+neighbouring ordinates' ground (a median 2.5 m above the stream cell on the FIM sites), or width-to-depth banks at
+the valley's shoulders (4 m), so the height is their BANK_HEIGHT_QUANTILE (the 10th percentile) within
+BANK_HEIGHT_WINDOW (500 m) along the reach, or the reach's, or the site's. Nothing comes from the network, so no
+inflow caps a reach. On the thesis's FIM benchmark (814 flood maps at 51 sites) it raised the maps' MCC by a mean of
+0.019 (95% 0.005 to 0.036, resampling sites) against legacy's smoothing, and the maps grew (frequency bias 1.07 to
+1.28): with a drainage-area depth, a channel is filled in where the bank elevation less the depth is above the DEM's
+water, as Bathy_Use_Banks allows. Letting the bank elevation rise downstream where the water or the banks do,
+instead of fitting it to fall, changed the maps by less than 0.001 either way and made them a little bigger still.
+A reach without observations of its own takes the site's height; only a site without any has no bank elevations.
 
 Where legacy ARC used bank indices
 ----------------------------------
@@ -78,6 +107,9 @@ from arc.xsection.xsection import XSection
 MIN_GRADE = 1e-4  # every reach and every cross section falls at least this much per metre downstream
 OUTLIER_PERCENTILES = (2, 97)  # observations outside these percentiles of their reach's are left out
 ORIENTING_CELLS = 10  # how many cross sections at each end decide which end of an unconnected reach is upstream
+BANK_HEIGHT_QUANTILE = 0.1  # the bank's height above the water: this quantile of the observations' heights...
+BANK_HEIGHT_WINDOW = 500.0  # ...within this many metres either side along the reach
+METHODS = ("water_plus_height", "legacy")
 
 
 class ReachWidths(NamedTuple):
@@ -101,7 +133,7 @@ class SmoothedReach(NamedTuple):
     banks: list[Banks]  # after the width filter
     bank_elevations: np.ndarray  # the smoothed bank elevations, NaN if the network gave the reach none
     observations: np.ndarray  # each cross section's observation, NaN for none or an outlier
-    anchors: np.ndarray  # whether each one's observation became an anchor of the surface
+    anchors: np.ndarray  # whether each one's observation became an anchor of the surface (method="legacy" only)
     order: np.ndarray  # the cross sections from upstream to downstream
     stations: np.ndarray  # how far each is along the stream from the upstream one, in metres
     widths: ReachWidths | None  # None if no cross section had valid banks
@@ -495,17 +527,101 @@ def reach_bank_surface(observations, baseline, fractions, length: float, outlet:
                    math.nan if ceiling is None else float(ceiling), thalwegs, float(lower), float(upper))
 
 
+# --- The bank level along a reach: the water surface plus the banks' height --------------------------------------
+
+
+@njit(cache=True, error_model="numpy")
+def _falling_fit(values):
+    n = values.size
+    sums = np.empty(n)
+    counts = np.empty(n, np.int64)
+    top = 0
+    for k in range(n):
+        if not math.isfinite(values[k]):
+            continue
+        sums[top], counts[top] = values[k], 1
+        top += 1
+        # a rise downstream: pool the two runs at their mean, and look again
+        while top > 1 and sums[top - 2] / counts[top - 2] < sums[top - 1] / counts[top - 1]:
+            sums[top - 2] += sums[top - 1]
+            counts[top - 2] += counts[top - 1]
+            top -= 1
+    fitted = np.full(n, np.nan)
+    block, left = 0, counts[0] if top > 0 else 0
+    for k in range(n):
+        if not math.isfinite(values[k]):
+            continue
+        fitted[k] = sums[block] / counts[block]
+        left -= 1
+        if left == 0 and block + 1 < top:
+            block += 1
+            left = counts[block]
+    return fitted
+
+
+def falling_fit(values) -> np.ndarray:
+    """The sequence that never rises closest to values in least squares (pool-adjacent-violators), in order; a NaN
+    is left out and stays NaN."""
+    return _falling_fit(np.asarray(values, dtype=np.float64))
+
+
+@njit(cache=True, error_model="numpy")
+def _running_quantile(values, stations, quantile, half_window):
+    n = values.size
+    out = np.full(n, np.nan)
+    part = np.empty(n)
+    for i in range(n):
+        count = 0
+        for j in range(n):
+            if abs(stations[j] - stations[i]) <= half_window and math.isfinite(values[j]):
+                part[count] = values[j]
+                count += 1
+        if count > 0:
+            out[i] = np.quantile(part[:count], quantile)
+    return out
+
+
+def reach_bank_levels(thalwegs, observations, stations, fallback_height: float, *,
+                      quantile: float = BANK_HEIGHT_QUANTILE, half_window: float = BANK_HEIGHT_WINDOW) -> np.ndarray:
+    """A reach's bank elevations, its cross sections in order from upstream to downstream (see the notes above).
+
+    thalwegs are the stream cells' elevations, observations the cross sections' observations (NaN for none) and
+    stations their distances along the reach in metres. The water surface is the thalwegs fitted never to rise
+    (falling_fit). Each cross section's bank height is the quantile of the observations' heights above their stream
+    cells within half_window metres, or the reach's quantile, or failing that fallback_height (the site's); the bank
+    elevation is the water surface plus that, fitted never to rise, and never below the stream cell. All NaN if the
+    reach has no height to take.
+    """
+    thalwegs = np.asarray(thalwegs, dtype=np.float64)
+    observations = np.asarray(observations, dtype=np.float64)
+    stations = np.asarray(stations, dtype=np.float64)
+    heights = observations - thalwegs
+    heights[~(heights > 0.0)] = math.nan
+    height = _running_quantile(heights, stations, float(quantile), float(half_window))
+    reach_height = float(np.quantile(heights[np.isfinite(heights)], quantile)) if np.isfinite(heights).any() \
+        else float(fallback_height)
+    height = np.where(np.isfinite(height), height, reach_height)
+    if not np.isfinite(height).all():
+        return np.full(thalwegs.size, math.nan)
+    known = np.isfinite(thalwegs)
+    water = np.interp(stations, stations[known], _falling_fit(thalwegs[known])) if known.any() else thalwegs
+    return np.maximum(_falling_fit(water + height), np.where(known, thalwegs, -math.inf))
+
+
 # --- Everything ---------------------------------------------------------------------------------------------------
 
 
-def smooth_bank_elevations(network: nx.DiGraph, reaches: Mapping[int, ReachSections], dx: float, dy: float
-                           ) -> dict[int, SmoothedReach]:
+def smooth_bank_elevations(network: nx.DiGraph, reaches: Mapping[int, ReachSections], dx: float, dy: float, *,
+                           method: str = "water_plus_height") -> dict[int, SmoothedReach]:
     """Smooth the bank elevations of every reach's cross sections along the network (see the notes above; legacy
     _smooth_reach_bank_elevations).
 
     network runs from each reach to the one downstream of it, with each reach's length in metres (reach_network).
-    Every reach with cross sections must be in it, and reaches without any can be too, as the network's links.
+    Every reach with cross sections must be in it, and reaches without any can be too, as the network's links, which
+    order its reaches. method="legacy" smooths the bank elevations as legacy did, a lower envelope along the network.
     """
+    if method not in METHODS:
+        raise ValueError(f"method must be one of {', '.join(METHODS)}, not {method!r}.")
     missing = sorted(reach for reach in reaches if reach not in network)
     if missing:
         raise ValueError("These reaches have cross sections but aren't in the stream network: "
@@ -522,6 +638,19 @@ def smooth_bank_elevations(network: nx.DiGraph, reaches: Mapping[int, ReachSecti
         order, stations = order_reach(network, reach, sections.rows, sections.cols, dx, dy, cells, observations)
         thalwegs = np.array([float(xs.elevations[xs.elevations.size // 2]) for xs in sections.sections])
         prepared[reach] = (banks, widths, observations, lower, upper, order, stations, thalwegs)
+
+    if method == "water_plus_height":
+        heights = [p[2] - p[7] for p in prepared.values()]
+        heights = np.concatenate(heights) if heights else np.empty(0)
+        heights = heights[heights > 0.0]
+        site_height = float(np.quantile(heights, BANK_HEIGHT_QUANTILE)) if heights.size else math.nan
+        smoothed = {}
+        for reach, (banks, widths, observations, _, _, order, stations, thalwegs) in prepared.items():
+            bank_elevations = np.full(observations.size, math.nan)
+            bank_elevations[order] = reach_bank_levels(thalwegs[order], observations[order], stations, site_height)
+            smoothed[reach] = SmoothedReach(banks, bank_elevations, observations, np.zeros(observations.size, bool),
+                                            order, stations, widths)
+        return smoothed
 
     finite = {reach: p[2][np.isfinite(p[2])] for reach, p in prepared.items()}
     minima = {reach: float(values.min()) for reach, values in finite.items() if values.size > 0}
