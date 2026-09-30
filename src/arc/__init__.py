@@ -16,8 +16,9 @@ Primary entry points
 
 Notes
 -----
-Most of ARC's core computation lives in
-:mod:`arc.Automated_Rating_Curve_Generator`.
+:class:`arc.arc.Arc` runs :func:`arc.pipeline.run`, which drives the modules
+under :mod:`arc.xsection`, :mod:`arc.bathymetry` and :mod:`arc.outputs`. The
+legacy :mod:`arc.Automated_Rating_Curve_Generator` is kept but no longer run.
 """
 
 from ._log import LOG

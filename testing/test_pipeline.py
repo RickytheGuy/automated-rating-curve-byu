@@ -22,6 +22,7 @@ from shapely.geometry import LineString
 
 from arc import pipeline
 from arc.Automated_Rating_Curve_Generator import main as legacy_main
+from arc.bathymetry.depth import trapezoid_depth
 from arc.config import Configs
 from arc.hydraulics import DepthRoughness, discharge
 from arc.io import Raster
@@ -241,6 +242,28 @@ def test_the_bathymetry_carves_a_channel_for_the_baseflow(tmp_path: Path, use_ba
     assert len(xs) == results.cells.count
     assert list(xs.columns) == ['COMID', 'Row', 'Col', 'XS1_Profile', 'Ordinate_Dist', 'Manning_N_Raster1',
                                 'XS2_Profile', 'Manning_N_Raster2', 'r1', 'c1', 'r2', 'c2']
+
+
+def test_the_bathymetry_depth_is_solved_with_the_water_class_s_n(tmp_path: Path) -> None:
+    """The channel is carved to carry the baseflow with the n it has between its banks, the water class's, not
+    legacy's fixed 0.03, so a rougher channel is carved deeper."""
+    depths = {}
+    for water_n in (0.03, 0.06):
+        folder = tmp_path / f"n{water_n}"
+        inputs = {**write_channel(folder, water_n=water_n), "BATHY_Out_File": str(folder / "bathy.tif"),
+                  "Bathy_Bed_Cap": False}
+        results = pipeline.run(Configs.from_mapping(inputs), quiet=True, write=False)
+        depths[water_n] = []
+        for k in np.flatnonzero(interior(results)):
+            section = results.sections[k]
+            depth = section.dem_low_point - section.xs.elevations[section.xs.elevations.size // 2]
+            top = section.hydraulic_banks.top_width
+            # Bathy_Trap_H is 0.2, so the bed is 0.6 of the top width; n is float32 as the Manning's table is read.
+            # The bed's running median is a step (1 mm here) off at a reach's ends (arc.bathymetry.bed_smoothing).
+            assert depth == pytest.approx(trapezoid_depth(results.baseflow[k], 0.6 * top, top, results.slopes[k],
+                                                          float(np.float32(water_n))), abs=2e-3)
+            depths[water_n].append(depth)
+    assert np.all(np.array(depths[0.06]) > np.array(depths[0.03]))
 
 
 def test_the_drainage_area_depth_is_carved_as_it_is(tmp_path: Path) -> None:

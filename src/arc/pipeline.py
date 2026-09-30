@@ -55,6 +55,9 @@ Errors in the legacy code, not repeated here
   Here it's the cell's own.
 - A reach without a smoothed bank elevation was dropped from the bathymetry and the rating curves even without
   Bathy_Use_Banks, where the bathymetry doesn't use it (arc.bathymetry.bed_smoothing). Here only with it.
+- Legacy solved the bathymetry depth with a fixed Manning's n of 0.03, whatever the Manning's n table gave the
+  channel, so a channel carved to carry the baseflow didn't carry it in the channel's own rating curve unless the
+  table's water n was 0.03. Here it's solved with the water class's n, the n the channel has between its banks.
 
 Not here
 --------
@@ -602,11 +605,13 @@ def unresolved_banks(xs: XSection, target_width: float) -> Banks:
 
 
 def apply_bathymetry(configs: Configs, grid: Grid, cells: Cells, sections: list, network, slopes, baseflow,
-                     target_depth, target_width) -> np.ndarray:
+                     target_depth, target_width, water_n: float) -> np.ndarray:
     """Smooth the banks, find, smooth and carve each channel, and return the filled bathymetry raster. With
     Bathy_Use_Banks, the sections of a reach given no bank elevation become unusable, as legacy dropped them (which
     the bank smoothing now does only where the site has no bank observation at all). A channel whose banks are still
-    unresolved after the width filter is carved at its width prior, or one cell wide (unresolved_banks)."""
+    unresolved after the width filter is carved at its width prior, or one cell wide (unresolved_banks). The depth
+    that carries the baseflow is solved with water_n, the water class's Manning's n, which is the n the channel has
+    between its banks."""
     if network is None:
         raise ValueError("Bathymetry needs the stream network, from StrmShp_File, reach_id and downstream_reach_id.")
     use_banks = configs.bathy_use_banks
@@ -641,7 +646,8 @@ def apply_bathymetry(configs: Configs, grid: Grid, cells: Cells, sections: list,
             section = sections[k]
             depth = bathymetry_depth(section.xs, section.hydraulic_banks, float(baseflow[k]), float(slopes[k]),
                                      trapezoid_height=configs.bathy_trap_h,
-                                     target_depth=None if math.isnan(target_depth[k]) else float(target_depth[k]))
+                                     target_depth=None if math.isnan(target_depth[k]) else float(target_depth[k]),
+                                     mannings_n=water_n)
             depths[reach].append(depth.depth)
             applies[reach].append(depth.apply)
     channels = smooth_channel_depths(network, reaches, {reach: smoothed[reach] for reach in reaches}, depths,
@@ -825,7 +831,7 @@ def run(configs: Configs, *, quiet: bool = False, write: bool = True) -> Results
     results = Results(configs, cells, slopes, baseflow, max_flow, sections)
     if configs.bathy_out_file:
         results.bathymetry = apply_bathymetry(configs, grid, cells, sections, network, slopes, baseflow,
-                                              target_depth, target_width)
+                                              target_depth, target_width, water_n)
     usable = [(k, s) for k, s in enumerate(sections) if s is not None and s.usable]
     for _, section in usable:
         set_bank_distances(section.xs, section.hydraulic_banks)

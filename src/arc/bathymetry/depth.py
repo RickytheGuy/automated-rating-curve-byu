@@ -2,7 +2,9 @@
 
 The reference level is the water surface the DEM shows at the stream cell, or with bank elevations
 (Bathy_Use_Banks) the bank elevation given. The channel carries the baseflow with its water at the reference level,
-by Manning's equation with legacy ARC's fixed roughness of 0.03. It is a trapezoid as wide as its banks at the
+by Manning's equation with the roughness given: arc.pipeline gives the water class's n from the Manning's n table,
+which is the n the channel has between its banks. Legacy ARC used a fixed 0.03 whatever the table said
+(LEGACY_MANNINGS_N), which is still the default here. It is a trapezoid as wide as its banks at the
 reference level, whose sloping sides each take up trapezoid_height of that width, whatever the depth: however wide it
 is, narrower than a cell included. A channel without valid banks is taken to be one cell wide (single_cell_banks).
 
@@ -23,7 +25,7 @@ from arc.bathymetry.banks import Banks, single_cell_banks
 from arc.hydraulics import _newton_or_bisect
 from arc.xsection.xsection import XSection
 
-MANNINGS_N = 0.03  # legacy ARC's roughness for the bathymetry depth, whatever the land cover
+LEGACY_MANNINGS_N = 0.03  # legacy ARC's roughness for the bathymetry depth, whatever the land cover; the default here
 
 
 class BathymetryDepth(NamedTuple):
@@ -79,7 +81,7 @@ def trapezoid_depth(q, bottom_width, top_width, slope, mannings_n):
 
 
 def channel_depth(xs: XSection, banks: Banks, q: float, slope: float, *, trapezoid_height: float,
-                  mannings_n: float = MANNINGS_N) -> float:
+                  mannings_n: float = LEGACY_MANNINGS_N) -> float:
     """How deep the channel is below its reference level to carry the baseflow q (see the notes above), which
     doesn't depend on what the reference level is.
 
@@ -96,7 +98,7 @@ def channel_depth(xs: XSection, banks: Banks, q: float, slope: float, *, trapezo
 
 
 def bathymetry_depth(xs: XSection, banks: Banks, q: float, slope: float, *, trapezoid_height: float,
-                     target_depth: float | None = None, mannings_n: float = MANNINGS_N) -> BathymetryDepth:
+                     target_depth: float | None = None, mannings_n: float = LEGACY_MANNINGS_N) -> BathymetryDepth:
     """The depth to carve the channel to: a drainage-area target depth if there's a valid one, which always applies,
     or otherwise channel_depth for the baseflow, which applies only with baseflow."""
     if target_depth is not None and math.isfinite(target_depth) and target_depth > 0.0:

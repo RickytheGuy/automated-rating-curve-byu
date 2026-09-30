@@ -195,10 +195,11 @@ def run_new(inputs: dict, capture: bool) -> tuple[float, dict | None]:
         store["initial"][(int(row), int(col))] = float(direction)
         return direction
 
-    def apply_bathymetry(configs, grid, cells, sections, network, slopes, baseflow, target_depth, target_width):
+    def apply_bathymetry(configs, grid, cells, sections, network, slopes, baseflow, target_depth, target_width,
+                         water_n):
         store["target_depth"], store["target_width"] = np.array(target_depth), np.array(target_width)
         return originals["apply_bathymetry"](configs, grid, cells, sections, network, slopes, baseflow,
-                                             target_depth, target_width)
+                                             target_depth, target_width, water_n)
 
     def smooth_bank_elevations(network, reaches, dx, dy):
         result = originals["smooth_bank_elevations"](network, reaches, dx, dy)

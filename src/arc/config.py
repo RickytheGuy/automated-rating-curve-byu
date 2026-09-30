@@ -12,7 +12,9 @@ from arc._log import LOG
 
 StreamSlopeMethod = Literal["local_average", "local_average_corrected", "reach_average", "end_points"]
 
-_CURVE2FLOOD_KEYS = {'comid_flow_file', 'make_output_gpkg', 'strmorder_field', 'outfld', 'outdep', 'outvel', 'outwse', 'mapper', 'topwidthplausiblelimit', 'tw_multfact', 'set_depth', 'localfloodoption', 'fsoutbathy', 'flood_waterlc_and_strm_cells', 'flow_direction_file', 'filled_dem_file', 'stream_info_file', 'fldpln_library', 'max_wse_rise', 'fldpln_median_filter_size', 'fldpln_max_drop_below_source', 'fs_adjust_flow_by_fraction'}
+_CURVE2FLOOD_KEYS = {'comid_flow_file', 'make_output_gpkg', 'strmorder_field', 'outfld', 'outdep', 'outvel', 'outwse', 'mapper', 'topwidthplausiblelimit', 'tw_multfact', 'set_depth', 'localfloodoption', 'fsoutbathy', 'flood_waterlc_and_strm_cells', 'flow_direction_file', 'filled_dem_file', 'stream_info_file', 'fldpln_library', 'max_wse_rise', 'fldpln_median_filter_size', 'fldpln_max_drop_below_source', 'fs_adjust_flow_by_fraction',
+                     # curve2flood's aliases, and the keys nencarta writes into the ARC input files it shares with curve2flood
+                     'floodspreader_specifydepth', 'floodlocalonly', 'land_watervalue', 'fldpln_max_wse_rise', 'median_filter_size', 'max_drop_below_source', 'outshp'}
 # Keys that legacy ARC wrote into its input files (Create_ARC_Model_Input_File) or read, but never used
 _UNUSED_LEGACY_KEYS = {'spatial_units', 'str_limit_val', 'print_vdt', 'bathywatermask'}
 
