@@ -90,6 +90,7 @@ class Configs:
     compression: str = "LZW"
 
     # Derived by validate_options(), so they cannot be set from the inputs
+    makes_rating_curves: bool = field(init=False, default=True)
     use_representative_baseflow_bathymetry: bool = field(init=False, default=False)
     use_bathymetry_powerlaw: bool = field(init=False, default=False)
     use_bathymetry_powerlaw_width: bool = field(init=False, default=False)
@@ -176,6 +177,13 @@ class Configs:
         if self.build_representative_cross_section and not self.representative_cross_section_file:
             raise ValueError("Building a representative cross section requires a representative_cross_section_file to be specified.")
 
+        # A run makes rating curves unless it only builds representative cross sections. Asked for an output of the
+        # rating curves as well, it makes both from the same cross sections, and carves its channels as it would
+        # without the representative cross sections, so that they don't change the rating curves.
+        makes_rating_curves = bool(not self.build_representative_cross_section or self.print_vdt_database
+                                   or self.print_ap_database or self.print_curve_file)
+        representative_only = self.build_representative_cross_section and not makes_rating_curves
+
         # Check if the coefficients are provided and drainage area. Otherwise, raise an error.
         provided_flags = {
             'drainage_area_field': bool(self.drainage_area_field),
@@ -212,17 +220,19 @@ class Configs:
                 "parameters because ARC reads the drainage area attribute from that dataset."
             )
 
+        # A run that only builds representative cross sections carves its channels for the baseflow when it has the
+        # flow file, its ID and its baseflow column, ahead of the depth power law, as legacy's representative runs did
         representative_baseflow_inputs = {
             'Flow_File': self.flow_file,
             'Flow_File_ID': self.flow_file_id,
             'Flow_File_BF': self.flow_file_bf,
         }
         b_use_representative_baseflow_bathymetry = bool(
-            self.build_representative_cross_section
+            representative_only
             and all(representative_baseflow_inputs.values())
         )
         if (
-            self.build_representative_cross_section
+            representative_only
             and any(representative_baseflow_inputs.values())
             and not b_use_representative_baseflow_bathymetry
         ):
@@ -246,7 +256,7 @@ class Configs:
             and provided_flags['exponent_width']
         )
 
-        if self.build_representative_cross_section:
+        if representative_only:
             has_bathymetry_source = bool(
                 b_use_representative_baseflow_bathymetry
                 or b_use_bathymetry_powerlaw
@@ -270,6 +280,7 @@ class Configs:
                 )
 
         # The dataclass is frozen, so derived values are set with object.__setattr__
+        object.__setattr__(self, 'makes_rating_curves', makes_rating_curves)
         object.__setattr__(self, 'use_representative_baseflow_bathymetry', b_use_representative_baseflow_bathymetry)
         object.__setattr__(self, 'use_bathymetry_powerlaw', b_use_bathymetry_powerlaw)
         object.__setattr__(self, 'use_bathymetry_powerlaw_width', b_use_bathymetry_powerlaw_width)

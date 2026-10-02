@@ -376,3 +376,32 @@ def test_representative_cross_sections_can_be_parquet(tmp_path: Path) -> None:
     empty = pd.read_parquet(tmp_path / "empty.parquet")
     assert empty.empty and list(empty.columns) == REPRESENTATIVE_CROSS_SECTION_COLUMNS
     assert empty["COMID"].dtype == np.int64 and empty["Mean_Discharge"].dtype == np.float64
+
+
+def test_a_reach_stops_at_the_first_stage_whose_hydraulics_are_not_finite() -> None:
+    """Water reaching a NaN in one cross section ends its reach: the stages before stand, and say where it ended."""
+    rng = np.random.default_rng(12)
+    samples = [flat_bed_sample(rng, 4)[0] for _ in range(3)] + [flat_bed_sample(rng, 5)[0]]
+    elevations, bed = samples[1].xs.elevations, samples[1].thalweg
+    center = elevations.size // 2
+    wall = center + int(np.argmax(elevations[center:] > bed))
+    elevations[wall:] = bed + 1.25  # a right overbank 1.25 m up, to a NaN at its end
+    elevations[-1] = np.nan
+
+    df = representative_cross_section_dataframe(samples)
+
+    ended = df[df["COMID"] == 4]
+    assert ended["Depth_Stage_Index"].tolist() == list(range(1, 13))  # at 1.3 m the water reaches the NaN
+    assert (ended["Reach_Inflect_Terrace_Depth"] == ended["Depth_Stage_Meters"].iloc[-1]).all()
+    assert (df["COMID"] == 5).sum() == 250
+
+
+@pytest.mark.parametrize("count", [0, 1, 7, 8, 9, 127, 128, 129, 255, 256, 257, 1000, 4099])
+def test_representative_means_sum_as_numpy_does(count: int) -> None:
+    """The compiled stages' sums are numpy's to the bit, so their means and deviations are numpy's too."""
+    from arc.outputs.representative import _sum
+
+    rng = np.random.default_rng(count)
+    values = rng.standard_normal(count + 3) * 10.0 ** rng.integers(-3, 6, count + 3)
+
+    assert _sum(values, 3, count) == np.sum(values[3:])

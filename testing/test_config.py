@@ -177,6 +177,45 @@ def test_bathymetry_options_are_derived_like_read_main_input_file(overrides: dic
     ) == expected
 
 
+RATING_CURVE_OUTPUTS = {"vdt": {"Print_VDT_Database": "vdt.csv"}, "ap": {"Print_AP_Database": "ap.csv"},
+                        "curve-file": {"Print_Curve_File": "curve.csv"}}
+
+
+def test_rating_curves_are_made_unless_only_representative_cross_sections_are_asked_for() -> None:
+    assert Configs.from_mapping(BASE_INPUTS).makes_rating_curves
+    assert not Configs.from_mapping({**BASE_INPUTS, **REPRESENTATIVE}).makes_rating_curves
+    for output in RATING_CURVE_OUTPUTS.values():
+        assert Configs.from_mapping({**BASE_INPUTS, **REPRESENTATIVE, **output}).makes_rating_curves
+
+
+@pytest.mark.parametrize("output", RATING_CURVE_OUTPUTS.values(), ids=RATING_CURVE_OUTPUTS.keys())
+@pytest.mark.parametrize(
+    "bathymetry",
+    [
+        pytest.param({"Flow_File_BF": "baseflow"}, id="baseflow"),
+        pytest.param({"Flow_File_BF": "baseflow", **DEPTH_POWERLAW, **WIDTH_POWERLAW}, id="baseflow-and-power-laws"),
+        pytest.param({**WIDTH_POWERLAW}, id="width-power-law"),
+        pytest.param({}, id="no-source"),
+    ],
+)
+def test_beside_rating_curves_representative_cross_sections_carve_as_the_rating_curves_do(output: dict,
+                                                                                          bathymetry: dict) -> None:
+    inputs = {**BASE_INPUTS, **bathymetry, **output, "AROutBATHY": "bathy.tif"}
+    alone = Configs.from_mapping(inputs)
+    both = Configs.from_mapping({**inputs, **REPRESENTATIVE})
+
+    derived = ("use_representative_baseflow_bathymetry", "use_bathymetry_powerlaw", "use_bathymetry_powerlaw_width",
+               "bathy_out_file", "makes_rating_curves")
+    assert [getattr(both, name) for name in derived] == [getattr(alone, name) for name in derived]
+
+
+def test_beside_rating_curves_a_flow_file_without_baseflow_is_no_fallback(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING, logger="arc._log"):
+        Configs.from_mapping({**BASE_INPUTS, **REPRESENTATIVE, **RATING_CURVE_OUTPUTS["vdt"]})
+
+    assert "Falling back" not in caplog.text
+
+
 def test_bathymetry_fallbacks_are_logged(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level(logging.WARNING, logger="arc._log"):
         Configs.from_mapping({**BASE_INPUTS, **REPRESENTATIVE, "AROutBATHY": "bathy.tif"})

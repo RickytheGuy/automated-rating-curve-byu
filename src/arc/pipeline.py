@@ -14,7 +14,7 @@ The steps
 1. Inputs: the flow file, the DEM, stream and land cover rasters, which must share one grid, and the stream network
    where the bathymetry, the slopes or the drainage-area power laws need it.
 2. Stream cells: the stream raster's cells whose ID is in the flow file (every stream cell for representative cross
-   sections), in the raster's row order, or the manual cross sections' cells.
+   sections built without flows), in the raster's row order, or the manual cross sections' cells.
 3. Slopes, by Stream_Slope_Method (arc.xsection.slope). The cells of reaches whose slope can't be resolved are
    skipped, as legacy skipped them.
 4. Roughness: the stream cells become water in the land cover, and each land cover class takes its n from the
@@ -25,10 +25,20 @@ The steps
 7. Bathymetry, if Bathy_Out_File is set (arc.bathymetry): each reach's banks and bank elevations smoothed along the
    network, each channel's depth, the depths and beds smoothed along the network, and the channel carved into each
    cross section and burned into the bathymetry raster, whose gaps are then filled.
-8. Rating curves (arc.rating_curve), or the representative cross sections (arc.outputs.representative).
+8. Rating curves (arc.rating_curve), and the representative cross sections (arc.outputs.representative) when they're
+   asked for. A run that only builds representative cross sections (one asked for no output of the rating curves)
+   doesn't make rating curves, and doesn't need a flow file unless it carves for the baseflow.
 9. Outputs (arc.outputs).
 
 The modules' notes list how each step differs from legacy ARC. These are the workflow's own differences.
+
+Representative cross sections and rating curves in one run
+-----------------------------------------------------------
+Legacy built either the rating curves or the representative cross sections. Here a run asked for both makes them
+from the same cross sections, those of the flow file's reaches, carved as they would be for the rating curves alone,
+so that asking for the representative cross sections doesn't change the rating curves. So the depth power law goes
+ahead of the baseflow, where a run that only builds representative cross sections carves for the baseflow when it
+has the flow file, its ID and its baseflow column, as legacy's did (arc.config).
 
 Where legacy used its own markers
 ---------------------------------
@@ -58,6 +68,8 @@ Errors in the legacy code, not repeated here
 - Legacy solved the bathymetry depth with a fixed Manning's n of 0.03, whatever the Manning's n table gave the
   channel, so a channel carved to carry the baseflow didn't carry it in the channel's own rating curve unless the
   table's water n was 0.03. Here it's solved with the water class's n, the n the channel has between its banks.
+- Representative cross sections carved for the baseflow were built for every reach in the stream raster, and a reach
+  the flow file had no flows for raised a KeyError. Here they're built for the reaches in both.
 
 Not here
 --------
@@ -181,9 +193,9 @@ class Results:
 
 
 def read_flows(configs: Configs) -> pd.DataFrame | None:
-    """The flow file's baseflow and maximum-flow columns, indexed by its IDs (legacy read_flow_file). None for
-    representative cross sections without baseflow bathymetry, which need no flows."""
-    if configs.build_representative_cross_section and not configs.use_representative_baseflow_bathymetry:
+    """The flow file's baseflow and maximum-flow columns, indexed by its IDs (legacy read_flow_file). None for a run
+    that only builds representative cross sections without baseflow bathymetry, which needs no flows."""
+    if not configs.makes_rating_curves and not configs.use_representative_baseflow_bathymetry:
         return None
     if not configs.flow_file or not configs.flow_file_id:
         raise ValueError("A Flow_File and its Flow_File_ID are needed for the rating curves.")
@@ -321,7 +333,7 @@ def read_manual_sections(configs: Configs) -> dict[int, dict]:
         df = pd.read_parquet(path)
     else:
         df = pd.read_csv(path, sep="\t" if path.lower().endswith((".tsv", ".txt")) else ",")
-    id_field = configs.reach_id if configs.build_representative_cross_section else configs.flow_file_id
+    id_field = configs.flow_file_id if configs.makes_rating_curves else configs.reach_id
     missing = sorted({id_field, *_REQUIRED_MANUAL_COLUMNS} - set(df.columns))
     if missing:
         raise KeyError("Manual cross-section file is missing required columns: " + ", ".join(missing))
@@ -374,8 +386,9 @@ def manual_section(record: dict) -> Section:
 
 
 def stream_cells(configs: Configs, grid: Grid, flows: pd.DataFrame | None, manual: dict | None) -> Cells:
-    """The cells to work on, in the stream raster's row order or the manual cross sections' (legacy _main)."""
-    if configs.build_representative_cross_section:
+    """The cells to work on, in the stream raster's row order or the manual cross sections' (legacy _main): those of
+    the flow file's reaches, or without flows, every stream cell."""
+    if flows is None:
         ids = np.unique(grid.streams)
         ids = ids[ids > 0]
     else:
@@ -466,7 +479,7 @@ def cell_slopes(configs: Configs, grid: Grid, cells: Cells, network, layer) -> t
     # end_points
     if layer is None:
         raise ValueError("The 'end_points' stream slope method requires a strmshp_file.")
-    id_field = configs.reach_id if configs.build_representative_cross_section else configs.flow_file_id
+    id_field = configs.flow_file_id if configs.makes_rating_curves else configs.reach_id
     if id_field not in layer.columns:
         raise KeyError(f"The stream network {configs.strmshp_file} has no field {id_field!r}.")
     dem = np.where(grid.dem >= OFF_RASTER_ELEVATION, np.nan, grid.dem)
@@ -835,19 +848,18 @@ def run(configs: Configs, *, quiet: bool = False, write: bool = True) -> Results
     usable = [(k, s) for k, s in enumerate(sections) if s is not None and s.usable]
     for _, section in usable:
         set_bank_distances(section.xs, section.hydraulic_banks)
-    if configs.xs_out_file or (configs.build_representative_cross_section
-                               and configs.representative_cross_section_file):
+    if configs.xs_out_file:
         results.cross_sections = [cross_section_record(s, cells.comids[k]) for k, s in usable]
 
     roughness = DepthRoughness(configs.k_decay, configs.shallow_factor, configs.deep_factor) \
         if configs.depth_varying_n else None
+    if configs.makes_rating_curves:
+        results.curves = rating_curves(configs, grid, cells, sections, slopes, baseflow, max_flow, roughness, quiet)
     if configs.build_representative_cross_section:
         samples = [RepresentativeSample(int(cells.comids[k]), s.xs, float(s.xs.elevations[s.xs.elevations.size // 2]),
                                         float(slopes[k])) for k, s in usable]
         results.representative = representative_cross_section_dataframe(
             samples, roughness=roughness, slope_factor=configs.slope_adjustment_factor)
-    else:
-        results.curves = rating_curves(configs, grid, cells, sections, slopes, baseflow, max_flow, roughness, quiet)
 
     if write:
         write_outputs(configs, grid, results, flows)

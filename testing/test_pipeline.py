@@ -279,11 +279,18 @@ def test_the_drainage_area_depth_is_carved_as_it_is(tmp_path: Path) -> None:
         assert depth == pytest.approx(target, abs=0.01)
 
 
+def representative_inputs(folder: Path, suffix: str = ".csv", **overrides) -> dict:
+    """The synthetic channel's inputs for a run that only builds representative cross sections."""
+    inputs = {**write_channel(folder), "Build_Representative_Cross_Section": True,
+              "Representative_Cross_Section_File": str(folder / f"representative{suffix}"), **overrides}
+    del inputs["Print_VDT_Database"]
+    return inputs
+
+
 @pytest.mark.parametrize("suffix", [".csv", ".parquet"])
 def test_representative_cross_sections(tmp_path: Path, suffix: str) -> None:
     path = tmp_path / f"representative{suffix}"
-    inputs = {**write_channel(tmp_path), "Build_Representative_Cross_Section": True,
-              "Representative_Cross_Section_File": str(path)}
+    inputs = representative_inputs(tmp_path, suffix)
     results = pipeline.run(Configs.from_mapping(inputs), quiet=True)
     df = pd.read_parquet(path) if suffix == ".parquet" else pd.read_csv(path)
 
@@ -294,6 +301,52 @@ def test_representative_cross_sections(tmp_path: Path, suffix: str) -> None:
     # 1 m deep in the trapezoid; the slopes at the reach's ends are the bed's too
     assert stage["Mean_Cross_Sectional_Area"] == pytest.approx(12.0, rel=1e-6)
     assert stage["Mean_Discharge"] == pytest.approx(trapezoid_discharge(1.0), rel=1e-4)
+
+
+@pytest.mark.parametrize("bathymetry", [{}, {"BATHY_Out_File": "bathy.tif"},
+                                        {"BATHY_Out_File": "bathy.tif", "drainage_area_field": "DA",
+                                         "coefficient_depth": 0.1, "exponent_depth": 0.5}],
+                         ids=["no-bathymetry", "baseflow-bathymetry", "power-law-bathymetry"])
+def test_representative_cross_sections_beside_the_rating_curves(tmp_path: Path, bathymetry: dict) -> None:
+    """Asked for both, a run makes both from the same cross sections, and the rating curves and bathymetry are the
+    ones it makes without the representative cross sections."""
+    def run(folder: Path, **extra) -> pipeline.Results:
+        inputs = {**write_channel(folder), **extra}
+        if "BATHY_Out_File" in extra:
+            inputs["BATHY_Out_File"] = str(folder / extra["BATHY_Out_File"])
+        return pipeline.run(Configs.from_mapping(inputs), quiet=True)
+
+    alone = run(tmp_path / "alone", **bathymetry)
+    both = run(tmp_path / "both", **bathymetry, Build_Representative_Cross_Section=True,
+               Representative_Cross_Section_File=str(tmp_path / "both" / "representative.csv"))
+
+    np.testing.assert_array_equal(both.curves.increments, alone.curves.increments)
+    np.testing.assert_array_equal(both.curves.metadata, alone.curves.metadata)
+    pd.testing.assert_frame_equal(pd.read_csv(tmp_path / "both" / "vdt.csv"), pd.read_csv(tmp_path / "alone" / "vdt.csv"))
+    if bathymetry:
+        np.testing.assert_array_equal(both.bathymetry, alone.bathymetry)
+    representative = pd.read_csv(tmp_path / "both" / "representative.csv")
+    assert sorted(representative["COMID"].unique()) == [11, 12]
+    if "coefficient_depth" not in bathymetry:
+        # Carving for the baseflow as the rating curves do, it is what a run building only them makes
+        only = pipeline.run(Configs.from_mapping(representative_inputs(
+            tmp_path / "only", **{k: str(tmp_path / "only" / v) for k, v in bathymetry.items()})), quiet=True)
+        pd.testing.assert_frame_equal(both.representative, only.representative, check_exact=True)
+
+
+def test_representative_cross_sections_carved_for_the_baseflow_are_of_the_reaches_with_flows(tmp_path: Path) -> None:
+    """Carving for the baseflow, a run building only representative cross sections works on the reaches in both the
+    flow file and the stream raster, where legacy raised a KeyError for a reach without flows."""
+    inputs = representative_inputs(tmp_path, BATHY_Out_File=str(tmp_path / "bathy.tif"))
+    flows = pd.read_csv(inputs["Flow_File"])
+    flows[flows["COMID"] == 11].to_csv(inputs["Flow_File"], index=False)
+    configs = Configs.from_mapping(inputs)
+
+    results = pipeline.run(configs, quiet=True)
+
+    assert configs.use_representative_baseflow_bathymetry
+    assert set(results.cells.comids.tolist()) == {11}
+    assert results.representative["COMID"].unique().tolist() == [11]
 
 
 def test_the_command_line_writes_the_outputs(tmp_path: Path) -> None:
