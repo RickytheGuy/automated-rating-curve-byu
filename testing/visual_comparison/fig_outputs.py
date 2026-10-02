@@ -84,6 +84,8 @@ def _same_discharge(ctx, config, site, share=0.5):
     """(row, col, legacy's water surface, the new one) for each shared cell at share of its maximum flow."""
     m = ctx.merged_vdt(config, site)
     capture = ctx.capture("as_configured", "new", site)
+    if m is None or capture is None:  # a site a code didn't run
+        return np.empty((0, 4))
     qmax = {(c["comid"], *c["center"]): c["qmax"] for c in capture["cells"] if c is not None}
     count = increments(m, "_l")
     out = []

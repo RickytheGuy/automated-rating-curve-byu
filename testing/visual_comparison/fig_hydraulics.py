@@ -170,6 +170,7 @@ def depth_varying_n(ctx):
     ax.set_ylabel("water levels")
     ax.legend(loc="upper left", fontsize=6.5)
     ax.set_title(f"150 cross sections of {ctx.site_label(site)[:24]}")
+    inner_n, both = stats[cases[0][0]], stats[cases[2][0]]
     return fig, dict(caption=(
         "Which end of a wetted segment of ground its roughness comes from. Legacy took a wholly wet segment's n₀, "
         "and with depth-varying n its depth, at the segment's outer end (and at the inner end of the segment where "
@@ -178,8 +179,9 @@ def depth_varying_n(ctx):
         "new discharge over legacy's on the same sections for each convention on its own, and both together. The "
         "stream cells are water, the smoothest class, and the ground mostly gets rougher away from the channel, so "
         "the inner end's n is mostly the lower: the new discharge is almost never lower, and for one water level in "
-        "ten it is 29% or more higher. The depth convention alone adds a few per cent. On flat, uniform ground they "
-        "agree to 1e-15 (a test)."), stats=stats)
+        f"ten it is {inner_n['p90'] - 1:.0%} or more higher ({both['p90'] - 1:.0%} with the depth convention as "
+        "well). On flat, uniform ground the two conventions agree to 1e-15 (a test). Legacy's ends were tested on the "
+        "flood maps with an option, since removed (F2)."), stats=stats)
 
 
 @figure("H3", "Dividing a cross section at its banks", "Hydraulics")

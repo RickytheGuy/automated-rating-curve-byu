@@ -329,6 +329,39 @@ def run_one(code: str, site: str, out: Path, sites_root: Path) -> None:
     (out / "done.json").write_text(json.dumps({"seconds": seconds}))
 
 
+def ensure_other_runs(runs: Path, sites_root: Path, sites: list[str], name: str, src: Path, script: Path,
+                      log=print) -> None:
+    """Another ARC's legacy code, such as a maintainer's branch (src is its src folder), on every site as configured,
+    captured as legacy's is, into runs/as_configured/<name>: each site in a process of its own with src ahead of this
+    repository's (run_other). A site it fails on says why in failed.txt, and isn't tried again."""
+    for site in sites:
+        out = run_directory(runs, "as_configured", name, site)
+        if (out / "done.json").exists() or (out / "failed.txt").exists():
+            continue
+        out.mkdir(parents=True, exist_ok=True)
+        process = subprocess.run([sys.executable, str(script), "--run-other", name, str(src), site, str(out),
+                                  "--sites-root", str(sites_root)], capture_output=True, text=True)
+        if process.returncode != 0 or not (out / "done.json").exists():
+            reason = (process.stderr.strip().splitlines() or ["no error message"])[-1]
+            (out / "failed.txt").write_text(reason + "\n")
+            log(f"  as_configured {name} {site}: FAILED {reason}")
+            continue
+        log(f"  as_configured {name} {site}: {json.loads((out / 'done.json').read_text())['seconds']:.1f} s")
+
+
+def run_other(src: Path, site: str, out: Path, sites_root: Path) -> None:
+    """The --run-other entry point: run_legacy, captured, with another ARC's src ahead of this repository's."""
+    sys.path.insert(0, str(src))
+    import arc
+    if Path(src).resolve() not in Path(arc.__file__).resolve().parents:
+        raise RuntimeError(f"arc was imported from {arc.__file__}, not from {src}")
+    inputs = site_inputs(sites_root, site, out, {}, ("vdt", "bathy", "xs"))
+    seconds, captured = run_legacy(inputs, True)
+    with open(out / "capture.pkl", "wb") as f:
+        pickle.dump(captured, f, protocol=pickle.HIGHEST_PROTOCOL)
+    (out / "done.json").write_text(json.dumps({"seconds": seconds, "arc": str(arc.__file__)}))
+
+
 def load_capture(runs: Path, config: str, code: str, site: str) -> dict | None:
     path = run_directory(runs, config, code, site) / "capture.pkl"
     if not path.exists():

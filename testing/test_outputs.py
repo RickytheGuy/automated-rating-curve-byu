@@ -6,15 +6,18 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from arc.bathymetry import carve_channel, find_banks
 from arc.hydraulic_data import HydraulicData, build_representative_cross_section_dataframe
 from arc.hydraulics import DepthRoughness, hydraulic_geometry
-from arc.outputs import (CrossSectionRecord, RatingCurves, RepresentativeSample, ap_dataframe, curve_file_dataframe,
-                         format_array, reach_average_curve_file_dataframe, representative_cross_section_dataframe,
-                         vdt_dataframe, write_ap, write_cross_sections, write_curve_file,
-                         write_reach_average_curve_file, write_representative_cross_sections, write_vdt)
+from arc.outputs import (REPRESENTATIVE_CROSS_SECTION_COLUMNS, XS_EXPORT_COLUMNS, CrossSectionRecord, RatingCurves,
+                         RepresentativeSample, ap_dataframe, curve_file_dataframe, format_array,
+                         reach_average_curve_file_dataframe, representative_cross_section_dataframe, vdt_dataframe,
+                         write_ap, write_cross_sections, write_curve_file, write_reach_average_curve_file,
+                         write_representative_cross_sections, write_table, write_vdt)
 from arc.xsection.xsection import XSection
 
 INCREMENTS = 6
@@ -80,6 +83,21 @@ def test_the_vdt_database_as_parquet_is_legacy_s(tmp_path: Path) -> None:
 
     pd.testing.assert_frame_equal(pd.read_parquet(tmp_path / "vdt.parquet"),
                                   pd.read_parquet(tmp_path / "legacy_vdt.parquet"))
+
+
+def test_parquet_tables_take_a_dictionary_only_where_values_repeat(tmp_path: Path) -> None:
+    """Brotli, and dictionary encoding only on the columns where under 30% of the values differ."""
+    rng = np.random.default_rng(12)
+    df = pd.DataFrame({"COMID": np.repeat([7, 8, 9], 100), "Row": np.arange(300),
+                       "v_1": rng.choice([0.5, 0.75, 1.125], 300), "wse_1": np.round(rng.uniform(100, 200, 300), 3)})
+
+    write_table(df, tmp_path / "table.parquet")
+
+    row_group = pq.ParquetFile(tmp_path / "table.parquet").metadata.row_group(0)
+    columns = {row_group.column(i).path_in_schema: row_group.column(i) for i in range(row_group.num_columns)}
+    assert {name for name, column in columns.items() if 'RLE_DICTIONARY' in column.encodings} == {"COMID", "v_1"}
+    assert {column.compression for column in columns.values()} == {'BROTLI'}
+    pd.testing.assert_frame_equal(pd.read_parquet(tmp_path / "table.parquet"), df)
 
 
 def test_the_ap_database_is_legacy_s(tmp_path: Path) -> None:
@@ -173,6 +191,53 @@ def test_an_empty_cross_section_file_is_legacy_s(tmp_path: Path) -> None:
     write_cross_sections([], tmp_path / "xs.txt")
 
     assert_same_file(tmp_path / "xs.txt", tmp_path / "legacy_xs.txt")
+
+
+ARRAY_COLUMNS = ('XS1_Profile', 'Manning_N_Raster1', 'XS2_Profile', 'Manning_N_Raster2')
+
+
+def test_the_cross_section_file_can_be_parquet(tmp_path: Path) -> None:
+    """In Parquet the profiles and n are lists of float64, the records' arrays exactly, which the text file prints."""
+    records = random_records(np.random.default_rng(6))
+    text = write_cross_sections(records + [None], tmp_path / "xs.txt")
+
+    returned = write_cross_sections(records + [None], tmp_path / "xs.parquet")
+
+    df = pd.read_parquet(tmp_path / "xs.parquet")
+    assert list(df.columns) == list(returned.columns) == XS_EXPORT_COLUMNS
+    assert len(df) == len(returned) == len(records)
+    for column, field in zip(XS_EXPORT_COLUMNS, CrossSectionRecord._fields):
+        expected = [getattr(record, field) for record in records]
+        if column in ARRAY_COLUMNS:
+            for value, array in zip(df[column], expected):
+                assert value.dtype == np.float64 and np.array_equal(value, array)
+            assert [format_array(value) for value in df[column]] == list(text[column])
+        else:
+            assert df[column].dtype == (np.float64 if column == 'Ordinate_Dist' else np.int64)
+            assert df[column].tolist() == expected
+
+
+def test_an_empty_cross_section_file_can_be_parquet(tmp_path: Path) -> None:
+    write_cross_sections([], tmp_path / "xs.parquet")
+
+    schema = pq.read_schema(tmp_path / "xs.parquet")
+    assert schema.names == XS_EXPORT_COLUMNS
+    for column in ARRAY_COLUMNS:
+        assert pa.types.is_list(schema.field(column).type) and schema.field(column).type.value_type == pa.float64()
+    assert pd.read_parquet(tmp_path / "xs.parquet").empty
+
+
+def test_parquet_cross_sections_split_the_elevations_bytes_and_keep_a_dictionary_of_n(tmp_path: Path) -> None:
+    """The layout that makes the file small. pyarrow silently ignores a list column named without its
+    '.list.element' path, which would undo it."""
+    write_cross_sections(random_records(np.random.default_rng(9)), tmp_path / "xs.parquet")
+
+    row_group = pq.ParquetFile(tmp_path / "xs.parquet").metadata.row_group(0)
+    columns = {row_group.column(i).path_in_schema: row_group.column(i) for i in range(row_group.num_columns)}
+    for side in (1, 2):
+        assert 'BYTE_STREAM_SPLIT' in columns[f'XS{side}_Profile.list.element'].encodings
+        assert 'RLE_DICTIONARY' in columns[f'Manning_N_Raster{side}.list.element'].encodings
+    assert {column.compression for column in columns.values()} == {'ZSTD'}
 
 
 def _array2string(values):
@@ -294,3 +359,20 @@ def test_representative_cross_sections_are_written_rounded_to_6_decimals(tmp_pat
     assert np.allclose(back["Mean_Discharge"], df["Mean_Discharge"].round(6))
     write_representative_cross_sections(None, tmp_path / "empty.csv")
     assert pd.read_csv(tmp_path / "empty.csv").empty
+
+
+def test_representative_cross_sections_can_be_parquet(tmp_path: Path) -> None:
+    rng = np.random.default_rng(11)
+    samples = [flat_bed_sample(rng, 3)[0] for _ in range(3)]
+    df = representative_cross_section_dataframe(samples)
+
+    write_representative_cross_sections(df, tmp_path / "representative.csv")
+    written = write_representative_cross_sections(df, tmp_path / "representative.parquet")
+
+    back = pd.read_parquet(tmp_path / "representative.parquet")
+    pd.testing.assert_frame_equal(back, written)
+    pd.testing.assert_frame_equal(back, pd.read_csv(tmp_path / "representative.csv"), check_exact=False, rtol=1e-12)
+    write_representative_cross_sections(None, tmp_path / "empty.parquet")
+    empty = pd.read_parquet(tmp_path / "empty.parquet")
+    assert empty.empty and list(empty.columns) == REPRESENTATIVE_CROSS_SECTION_COLUMNS
+    assert empty["COMID"].dtype == np.int64 and empty["Mean_Discharge"].dtype == np.float64

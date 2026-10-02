@@ -12,7 +12,8 @@ Settings (all optional):
   (vc_smoothing).
 - bank_reference: "clamp", "local", "local_median", or the new smoothings "falling_quantile" and
   "water_plus_height", the level the channel is carved below (bank_reference), with bank_quantile (0.25) and
-  bank_half_window (500 m) for the new two, and bank_falling ("both", "water" or "none") for water_plus_height.
+  bank_half_window (500 m) for the new two, and bank_falling ("both", "water" or "none") for water_plus_height;
+  or "joseph_monotone", Joseph Gutenson's bank smoothing from his branch (joseph_smoothing).
 - bed_at_most_stream: a test only, not a proposal (the user ruled that bank-based bathymetry may raise the DEM):
   each channel carved at least down to its stream cell, so no bed is above the DEM's water.
 - pivot: "each" for the cross section pivoting to the narrowest candidate at every increment of its rating curve,
@@ -172,6 +173,103 @@ def bank_reference(original, rule: str, quantile: float = 0.25, half_window: flo
     return smooth_bank_elevations
 
 
+# --- Joseph Gutenson's bank smoothing (MikeFHS/automated-rating-curve, branch varying_roughness_and_slope, 187eb40) --
+
+JOSEPH_MIN_SLOPE = 1e-4  # his MIN_SLOPE: the profile's grade where no lower bank remains
+JOSEPH_MAX_SLOPE = 0.5  # his MAX_SLOPE: the steepest the profile falls to the next lower bank
+JOSEPH_PERCENTILES = (10.0, 90.0)  # his code's outlier band (his notes say the 25th and 75th)
+
+
+def joseph_outliers(observed: np.ndarray) -> np.ndarray:
+    """His _replace_reach_bank_outliers_with_downstream: with four or more finite banks, each outside the band takes
+    the first kept bank downstream of it, or at the reach's end the last kept one upstream."""
+    observed = np.asarray(observed, dtype=np.float64)
+    filtered = observed.copy()
+    finite = np.isfinite(observed)
+    if np.count_nonzero(finite) < 4:
+        return filtered
+    low, high = np.percentile(observed[finite], JOSEPH_PERCENTILES)
+    kept = finite & (observed >= low) & (observed <= high)
+    positions = np.flatnonzero(kept)
+    for position in np.flatnonzero(finite & ~kept):
+        downstream = positions[positions > position]
+        filtered[position] = observed[downstream[0] if downstream.size else positions[positions < position][-1]]
+    return filtered
+
+
+def joseph_profile(observed: np.ndarray, stations: np.ndarray, upstream_control: float | None) -> np.ndarray:
+    """His _build_downstream_monotone_bank_profile: from the first bank (no higher than the lowest inflow's
+    outlet), a line to each next bank lower than the profile, falling no faster than JOSEPH_MAX_SLOPE, level to an
+    equal one, and at JOSEPH_MIN_SLOPE to the end where none is lower. The stream cell doesn't bound it."""
+    observed = np.asarray(observed, dtype=np.float64)
+    profile = np.empty_like(observed)
+    profile[0] = observed[0] if np.isfinite(observed[0]) else float(upstream_control)
+    if upstream_control is not None:
+        profile[0] = min(profile[0], float(upstream_control))
+    anchor = 0
+    while anchor < observed.size - 1:
+        if observed[anchor + 1] == profile[anchor]:
+            profile[anchor + 1] = observed[anchor + 1]
+            anchor += 1
+            continue
+        downstream = observed[anchor + 1:]
+        lower = np.flatnonzero(np.isfinite(downstream) & (downstream < profile[anchor]))
+        if lower.size:
+            following = anchor + 1 + int(lower[0])
+            slope = min((profile[anchor] - observed[following]) / (stations[following] - stations[anchor]),
+                        JOSEPH_MAX_SLOPE)
+        else:
+            following, slope = observed.size - 1, JOSEPH_MIN_SLOPE
+        span = np.arange(anchor + 1, following + 1)
+        profile[span] = profile[anchor] - slope * (stations[span] - stations[anchor])
+        anchor = following
+    return profile
+
+
+def joseph_smoothing(original, counts: dict | None = None):
+    """smooth_bank_elevations with his bank smoothing in place of the bank elevations (see joseph_profile): each
+    cross section's lower valid bank, whether or not above its stream cell, ordered and filtered by reach
+    (joseph_outliers), and the reaches taken in the network's order, each starting no higher than the lowest outlet
+    flowing into it (a reach without cross sections passing its inflows' on). Where his code stops, at a headwater
+    whose first bank is missing, this starts at the first bank downstream instead (counted in counts["started_late"]);
+    a reach with no bank and no inflow gets none."""
+    import networkx as nx
+
+    def smooth_bank_elevations(network, reaches, dx, dy):
+        smoothed = original(network, reaches, dx, dy)
+        outlets: dict = {}
+        out = dict(smoothed)
+        for reach in nx.topological_sort(network):
+            incoming = [outlets[p] for p in network.predecessors(reach) if p in outlets]
+            control = min(incoming) if incoming else None
+            if reach not in smoothed:
+                if control is not None:
+                    outlets[reach] = control
+                continue
+            result = smoothed[reach]
+            order = np.asarray(result.order)
+            stations = np.asarray(result.stations, dtype=np.float64)
+            stations = stations + 1e-9 * np.arange(stations.size)  # his stations must increase
+            raw = np.array([min((e for e in (b.left_elevation, b.right_elevation) if np.isfinite(e)), default=np.nan)
+                            if b.valid else np.nan for b in result.banks], dtype=np.float64)
+            filtered = joseph_outliers(raw[order])
+            bank = np.full(raw.size, np.nan)
+            if not np.isfinite(filtered[0]) and control is None:
+                finite = np.flatnonzero(np.isfinite(filtered))
+                if finite.size == 0:
+                    out[reach] = result._replace(bank_elevations=bank)
+                    continue
+                filtered[0] = filtered[finite[0]]
+                if counts is not None:
+                    counts["started_late"] = counts.get("started_late", 0) + 1
+            profile = joseph_profile(filtered, stations, control)
+            outlets[reach] = float(profile[-1])
+            bank[order] = profile
+            out[reach] = result._replace(bank_elevations=bank)
+        return out
+    return smooth_bank_elevations
+
+
 @contextmanager
 def applied(settings: dict, configs=None):
     """Patch arc.pipeline (and the configs, if given) for these settings, and put everything back afterwards."""
@@ -200,7 +298,9 @@ def applied(settings: dict, configs=None):
         patch(pipeline, "smooth_bank_elevations", vc_smoothing.smoother(settings))
         if settings["bank_ceiling"] == "main_stem":
             patch(pipeline, "stream_network", vc_smoothing.network_with_areas(pipeline.stream_network))
-    if settings.get("bank_reference"):
+    if settings.get("bank_reference") == "joseph_monotone":
+        patch(pipeline, "smooth_bank_elevations", joseph_smoothing(pipeline.smooth_bank_elevations))
+    elif settings.get("bank_reference"):
         rule = settings["bank_reference"]
         base = pipeline.smooth_bank_elevations
         if rule in LEGACY_BASED and not settings.get("bank_ceiling") and settings.get("bank_smoothing") != "legacy":
@@ -212,6 +312,21 @@ def applied(settings: dict, configs=None):
         import vc_pivot
         for owner, name, value in vc_pivot.patches(pipeline, settings["pivot"]):
             patch(owner, name, value)
+    if "depth_n" in settings:  # the n the channel's depth is solved with (legacy's fixed 0.03), not the water class's
+        depth_n = settings["depth_n"]
+        apply = pipeline.apply_bathymetry
+
+        def apply_bathymetry(*args, **kwargs):
+            if "water_n" in kwargs:
+                kwargs["water_n"] = depth_n
+            else:
+                args = args[:-1] + (depth_n,)
+            return apply(*args, **kwargs)
+        patch(pipeline, "apply_bathymetry", apply_bathymetry)
+    if settings.get("bank_shelf"):  # the ground beyond a narrow channel's bank top runs level to the DEM's bank (vc_shelf)
+        import vc_shelf
+        methods = None if settings["bank_shelf"] == "all" else vc_shelf.POWER_LAW
+        patch(pipeline, "carve_channel", vc_shelf.carving_with_shelves(pipeline.carve_channel, methods=methods))
     if settings.get("bed_at_most_stream"):  # a test only: no bed above the stream cell, so no channel is filled
         carve = pipeline.carve_channel
 
@@ -224,9 +339,12 @@ def applied(settings: dict, configs=None):
     if configs is not None:
         for key, value in settings.get("configs", {}).items():
             patches.append((configs, key, getattr(configs, key)))
-            setattr(configs, key, value)
+            object.__setattr__(configs, key, value)  # Configs is frozen
     try:
         yield
     finally:
         for owner, name, value in reversed(patches):
-            setattr(owner, name, value)
+            if owner is configs:
+                object.__setattr__(owner, name, value)
+            else:
+                setattr(owner, name, value)

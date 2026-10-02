@@ -387,7 +387,7 @@ def _valley_errors(amplitude, noise, count=6):
 
 @figure("D6", "Which test depth: made-up valleys whose directions are known", "Stream direction and the angle search")
 def test_depth_synthetic(ctx):
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4.2), sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.9), sharey=True)
     stats = {}
     for ax, (amplitude, title) in zip(axes, ((0.0, "a straight channel down a straight valley"),
                                              (150.0, "a channel meandering 150 m either side of the valley's axis"))):
@@ -411,15 +411,14 @@ def test_depth_synthetic(ctx):
                 ax.axhline(np.median(errors["none"][1]), color=ACCENT, ls=style, lw=0.9, alpha=0.8,
                            label=f"no search, from the channel's ({noise:g} m)")
         ax.axvline(0.5, color=LEGACY, lw=0.8, ls=":")
-        ax.text(0.5, 0.98, " 0.5 m, legacy's", color=LEGACY, fontsize=7, transform=ax.get_xaxis_transform(), va="top")
         ax.axvline(5.0, color=NEW, lw=0.8, ls=":")
-        ax.text(5.0, 0.98, " 5 m, the new code's", color=NEW, fontsize=7, transform=ax.get_xaxis_transform(), va="top")
         ax.set_xscale("log")
         ax.set_xticks(TEST_DEPTHS)
         ax.set_xticklabels([f"{d:g}" for d in TEST_DEPTHS])
-        ax.set_xlabel("test depth above the stream cell (m)")
+        ax.set_xlabel("test depth above the stream cell (m); legacy's is 0.5 m, the new code's 5 m (dotted)")
         ax.set_title(title, fontsize=8.5)
-        ax.legend(loc="upper right", fontsize=6.4)
+    handles, labels = axes[1].get_legend_handles_labels()  # the meandering panel's lines include the straight one's
+    fig.legend(handles, labels, loc="outside lower center", ncol=4, fontsize=7.5)
     axes[0].set_ylabel("median error in the chosen cross section's direction (°)")
     return fig, dict(caption=(
         "Made-up valleys at random angles on Cuyahoga's cells (six of each kind): a 36 m channel whose DEM water is "

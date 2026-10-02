@@ -10,7 +10,7 @@ dependencies = [
   "numpy",
   "matplotlib",
   "pandas",
-  "fastparquet",
+  "pyarrow",
   "geopandas",
   "gdal",
   "pip",

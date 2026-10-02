@@ -3,18 +3,19 @@
 A RatingCurves holds what legacy ARC's output array held: per stream cell its metadata (COMID, row, column, DEM
 elevation, baseflow, slope, cross-section angle and the channel bed's elevation), and per flow increment its
 discharge, velocity, top width, water surface elevation and wetted perimeter. A cell without a rating curve is NaN
-throughout. The writers make the same files from it that legacy HydraulicData's save_vdt and save_ap did.
+throughout. The writers make the same tables from it that legacy HydraulicData's save_vdt and save_ap did, written
+as arc.outputs.tables writes them.
 """
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
 
 from arc import LOG
+from arc.outputs.tables import write_table
 
 METADATA_COLUMNS = ['COMID', 'Row', 'Col', 'Elev', 'QBaseflow', 'Slope', 'XS_Angle', 'BaseElev']
 INCREMENT_FIELDS = ['q', 'v', 't', 'wse', 'p']
@@ -49,14 +50,6 @@ class RatingCurves(NamedTuple):
         return bool(np.any(~np.isnan(self.increments[:, -1, P]))) if self.number_of_increments else False
 
 
-def _write_table(df: pd.DataFrame, path: os.PathLike) -> None:
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    if str(path).endswith('.parquet'):
-        df.to_parquet(path, compression='brotli', index=False)  # brotli does very well with these tables
-    else:
-        df.to_csv(path, index=False)
-
-
 def vdt_dataframe(curves: RatingCurves) -> pd.DataFrame:
     """The VDT database (legacy save_vdt): the cells with complete rating curves, without their wetted perimeters
     or bed elevations, rounded as legacy ARC rounded them, and without rows that repeat or have a negative
@@ -79,7 +72,7 @@ def vdt_dataframe(curves: RatingCurves) -> pd.DataFrame:
 def write_vdt(curves: RatingCurves, path: os.PathLike) -> pd.DataFrame:
     """Write the VDT database, as CSV or, for a .parquet path, Parquet, and return it."""
     vdt_df = vdt_dataframe(curves)
-    _write_table(vdt_df, path)
+    write_table(vdt_df, path)
     LOG.info('Finished writing ' + str(path))
     return vdt_df
 
@@ -108,6 +101,6 @@ def ap_dataframe(curves: RatingCurves) -> pd.DataFrame:
 def write_ap(curves: RatingCurves, path: os.PathLike) -> pd.DataFrame:
     """Write the AP database, as CSV or, for a .parquet path, Parquet, and return it."""
     ap_df = ap_dataframe(curves)
-    _write_table(ap_df, path)
+    write_table(ap_df, path)
     LOG.info('Finished writing ' + str(path))
     return ap_df

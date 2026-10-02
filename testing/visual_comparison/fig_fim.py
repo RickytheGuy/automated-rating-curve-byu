@@ -14,6 +14,10 @@ GROUPS = (
      (("new_td05", "test depth 0.5 m (legacy's)"), ("new_td1", "test depth 1 m"), ("new_td2", "test depth 2 m"),
       ("new_td10", "test depth 10 m"), ("new_nosearch", "no search (Degree_Manip 0)"))),
     ("the bed cap (the new code's is MAX_SLOPE)", (("new_cap001", "1 cm per metre (legacy's)"), ("new_nocap", "no cap"))),
+    # tested on 2026-10-01 with an option (Segment_Roughness) that was removed afterwards; the row shows the scores
+    # kept from that run
+    ("a segment's roughness (the new code's: its inner end's n)",
+     (("new_legacy_segment_n", "a wholly wet segment's outer end (legacy's)"),)),
     ("the new smoothing's constraint: never rising downstream",
      (("new_wh10_bankfree", "the bank elevation free to rise"),
       ("new_wh10_free", "the water surface and the bank elevation free to rise"))),
@@ -27,6 +31,8 @@ GROUPS = (
     ("a test of the fills, not a proposal", (("new_nofill", "no bed above the stream cell"),)),
     ("the cross section's direction as the water rises (PV1)",
      (("new_pivot", "pivoting at every increment"), ("new_pivot_top", "the direction narrowest at the top, throughout"))),
+    ("Joseph's branch, varying_roughness_and_slope (JG4)",
+     (("joseph", "his ARC, on the sites it runs"), ("new_joseph_smoothing", "his bank smoothing in the new code"))),
     ("for scale", (("legacy", "legacy ARC"),)),
 )
 # the new code as it is, for the captions
@@ -100,7 +106,7 @@ def new_against_legacy(ctx):
         ax.text(k, per_site.iloc[k], " " + per_site.index[k].replace("_", " ")[:26], rotation=90, fontsize=5.8,
                 va="bottom" if per_site.iloc[k] > 0 else "top", ha="center")
     ax.set_xticks([])
-    ax.set_xlabel("the 51 sites, sorted")
+    ax.set_xlabel(f"the {per_site.size} sites, sorted")
     ax.set_ylabel("new − legacy, the site's mean MCC")
     lo, hi = site_bootstrap(j["d"])
     note(ax, f"mean {j['d'].mean():+.4f} (95%, resampling sites: {lo:+.4f} to {hi:+.4f})\n"
@@ -128,7 +134,7 @@ def new_against_legacy(ctx):
         "smoothing, until 2026-09-26, it was worse on the mean, losing most at Flint, East Fork White and South "
         "Platte, where the carve dug whole incised channels out below a bank elevation metres under their banks "
         f"(F2, F3, BS3). Right: the new maps are {'bigger' if bigger else 'smaller'} than legacy's at the median."),
-                 stats=dict(pairs=int(len(j)), legacy_median=rounded(j["mcc"].median(), 4),
+                 stats=dict(pairs=int(len(j)), sites=int(per_site.size), legacy_median=rounded(j["mcc"].median(), 4),
                             new_median=rounded(j["mcc_o"].median(), 4), mean_difference=rounded(j["d"].mean(), 4),
                             interval=[rounded(lo, 4), rounded(hi, 4)], median_difference=rounded(j["d"].median(), 4),
                             sites_better=rounded(np.mean(per_site > 0), 3),
@@ -151,7 +157,8 @@ def variants(ctx):
                              median=j["d"].median(), bias=j["bias_o"].median(), mcc=j["mcc_o"].median(),
                              changed=float(np.mean(np.abs(j["d"]) > 1e-9)), sites_better=float(np.mean(per_site > 0)),
                              spread=(float(per_site.min()), float(per_site.max())),
-                             worst=per_site.sort_values().head(3), best=per_site.sort_values().tail(3)[::-1]))
+                             worst=per_site.sort_values().head(3), best=per_site.sort_values().tail(3)[::-1],
+                             sites=int(per_site.size)))
     fig, axes = plt.subplots(1, 2, figsize=(14, 0.36 * len(rows) + 1.8), gridspec_kw=dict(width_ratios=[1.3, 1]),
                              sharey=True)
     y = np.arange(len(rows))[::-1].astype(float)
@@ -200,11 +207,13 @@ def variants(ctx):
         "depth from 0.5 to 2 m, or no search at all, moves the maps by less than the sites' noise "
         f"({min(search):+.4f} to {max(search):+.4f}); 10 m is worse, {change('new_td10')}. Legacy's bed cap changes "
         f"{by['new_cap001']['changed'] if 'new_cap001' in by else float('nan'):.0%} of the pairs, by next to nothing. "
+        "Taking a wholly wet segment's n from its outer end, as legacy did (H2; tested with an option since "
+        f"removed), gives {change('new_legacy_segment_n')}, bias {bias('new_legacy_segment_n')}. "
         "Relaxing the new smoothing's one constraint, that the bank elevation never rises downstream, changes the "
         f"mean by next to nothing too: the bank elevation free to rise, {change('new_wh10_bankfree')}, and the water "
         "surface too, "
         f"{change('new_wh10_free')}, with the maps a little bigger (bias {bias('new_wh10_bankfree')} and "
-        f"{bias('new_wh10_free')}), though single maps move (F3). What moves the maps is the level the channel is "
+        f"{bias('new_wh10_free')}), though single sites move. What moves the maps is the level the channel is "
         f"carved below: legacy's smoothing changes them by {change('new_legacy_smoothing')}, most at the sites of F3, "
         f"and with its two small fixes by {change('new_observed_clamp')}. The 25th percentile of the heights, "
         f"{change('new_wh25')}, and the falling fit of the banks' 25th percentile, {change('new_fq25')}, are within "
@@ -214,7 +223,10 @@ def variants(ctx):
         f"(bank-based bathymetry may raise the DEM, as decided on 2025-09-18), gives {change('new_nofill')}, bias "
         f"{bias('new_nofill')}. Letting the cross section pivot to where the water is narrowest at every increment of "
         f"its rating curve (PV1) gives {change('new_pivot')}, bias {bias('new_pivot')}; taking the direction narrowest "
-        f"at the top for the whole curve, {change('new_pivot_top')}, bias {bias('new_pivot_top')}."),
+        f"at the top for the whole curve, {change('new_pivot_top')}, bias {bias('new_pivot_top')}. Joseph's branch "
+        f"(JG4), on the {by['joseph']['sites'] if 'joseph' in by else 0} sites it runs, gives {change('joseph')}, bias "
+        f"{bias('joseph')}; his bank smoothing in the new code, {change('new_joseph_smoothing')}, bias "
+        f"{bias('new_joseph_smoothing')}."),
                  stats={"new": dict(median_mcc=rounded(scores(ctx, "new")["mcc"].median(), 4),
                                     bias=rounded(scores(ctx, "new")["bias"].median(), 3)),
                         **{r["name"]: dict(mean=rounded(r["mean"], 4), interval=[rounded(r["lo"], 4), rounded(r["hi"], 4)],
@@ -227,7 +239,7 @@ def variants(ctx):
 
 
 MAP_CONFIGS = (("legacy", "legacy"), ("new_legacy_smoothing", "new, with legacy's bank smoothing"),
-               ("new", "new, as it is"), ("new_wh10_free", "new, free to rise downstream"))
+               ("new_joseph_smoothing", "new, with Joseph's bank smoothing"), ("new", "new, as it is"))
 
 
 @figure("F3", "Flood maps at four sites", SECTION, needs_fim=True)
@@ -291,6 +303,7 @@ def maps(ctx):
         "water surfaces at Flint, East Fork White and South Platte were metres lower than legacy's, because its carve "
         "dug out incised channels below a bank elevation far under their banks (C4b, BS3), and the maps shrank. The "
         "new smoothing (BS4) carves below the DEM's water plus a low percentile of the banks' heights, and the maps "
-        "grow back. Their MCC, " + " / ".join(label for _, label in configs) + f": {scored}. Cuyahoga is one of the "
+        "grow back; Joseph's smoothing (JG1) in the new code does better than legacy's at some of these sites and "
+        "worse at others (below both at East Fork White). Their MCC, " + " / ".join(label for _, label in configs) + f": {scored}. Cuyahoga is one of the "
         "sites the new code already did better on than legacy, whose map there is more than twice the reference's."),
         stats=stats)

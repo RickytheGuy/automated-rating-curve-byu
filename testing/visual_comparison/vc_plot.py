@@ -46,13 +46,14 @@ plt.rcParams.update({
 REGISTRY: list[dict] = []
 
 
-def figure(fid: str, title: str, section: str, *, needs_timing: bool = False, needs_fim: bool = False):
+def figure(fid: str, title: str, section: str, *, needs_timing: bool = False, needs_fim: bool = False,
+           needs_other: bool = False):
     """Register a figure function. It takes the Context and returns (matplotlib figure, record), where the record
-    says what the figure shows ("caption") and what it found ("stats"). needs_timing and needs_fim say it needs the
-    timing runs or the FIM benchmark's results (fim_benchmark.py)."""
+    says what the figure shows ("caption") and what it found ("stats"). needs_timing, needs_fim and needs_other say
+    it needs the timing runs, the FIM benchmark's results (fim_benchmark.py) or another ARC's runs (--other)."""
     def register(function):
         REGISTRY.append(dict(id=fid, title=title, section=section, function=function, needs_timing=needs_timing,
-                             needs_fim=needs_fim))
+                             needs_fim=needs_fim, needs_other=needs_other))
         return function
     return register
 
@@ -97,6 +98,7 @@ class Context:
     detail_sites: list
     timing: bool = True
     fim: Path | None = None  # the FIM benchmark's folder (fim_benchmark.py --out), if it has been run
+    others: dict = field(default_factory=dict)  # other ARCs run as legacy (make_figures --other): name -> src
     _cache: dict = field(default_factory=dict)
 
     @cached_property

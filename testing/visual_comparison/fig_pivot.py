@@ -63,7 +63,7 @@ def _all(ctx):
             yield site, cell
 
 
-@figure("PV1", "Where the cross sections pivot, and how far, on the 51 sites", SECTION)
+@figure("PV1", "Where the cross sections pivot, and how far, on the sites", SECTION)
 def pivot_sites(ctx):
     count = None
     pivoted, angles, bank_below = [], [], []
@@ -71,10 +71,12 @@ def pivot_sites(ctx):
     reproduced = total = only_fixed = only_pivot = both = 0
     held = np.zeros((2, 2), dtype=int)
     seconds = np.zeros(2)
+    sites = 0
     for site in ctx.sites:
         capture = ctx.capture("pivot", "new", site)
         if capture is None:
             continue
+        sites += 1
         seconds += [capture["seconds"]["fixed"], capture["seconds"]["pivot"]]
         for cell in capture["cells"]:
             total += 1
@@ -146,7 +148,8 @@ def pivot_sites(ctx):
     ax.set_ylabel("share of cells")
     ax.legend(loc="upper left", fontsize=6.5)
     finite = np.isfinite(d_half)
-    stats = dict(cells=total, reproduces_fixed=reproduced, both=both, only_fixed=only_fixed, only_pivot=only_pivot,
+    stats = dict(sites=sites, cells=total, reproduces_fixed=reproduced, both=both, only_fixed=only_fixed,
+                 only_pivot=only_pivot,
                  any_pivot=rounded(np.mean(pivoted.any(1)), 3), increments_pivoted=rounded(pivoted.mean(), 3),
                  increments_below_bank=rounded(bank_below.mean(), 3),
                  top_pivoted=rounded(np.mean(top_angles > 0), 3),
@@ -325,7 +328,8 @@ def pivot_curves(ctx):
     if picks:
         axes[0, 0].legend(loc="lower right", fontsize=6.5)
     return fig, dict(caption=(
-        "Rating curves at six cells of the 51 sites, fixed and pivoting, chosen at the 2nd, 10th, 30th, 70th, 90th "
+        f"Rating curves at six cells of the {len({site for _, site, _ in pairs})} sites, fixed and pivoting, chosen at "
+        "the 2nd, 10th, 30th, 70th, 90th "
         "and 98th percentiles of how far pivoting moves the top. Circles are increments whose cross section has "
         "pivoted. Up to the bank elevation the two are the same; above it, a cross section turned to where the water is "
         "narrowest carries less at a level where it is narrower but no deeper, and more where it is narrower and "

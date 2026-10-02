@@ -1,9 +1,10 @@
 """The cross-section file (XS_Out_File): each stream cell's cross section, as legacy HydraulicData's
-save_cross_section_file wrote it.
+save_cross_section_file wrote it, or as Parquet.
 
-The file is tab-separated, with a row per cross section. Its profiles and Manning's n run out from the stream cell
-on each side, the two sides as legacy ARC numbered them, and are written as numpy prints arrays, as legacy wrote
-them with np.array2string(..., precision=6, floatmode='fixed').
+The file has a row per cross section. Its profiles and Manning's n run out from the stream cell on each side, the
+two sides as legacy ARC numbered them. The tab-separated file prints them as numpy prints arrays, as legacy wrote
+them with np.array2string(..., precision=6, floatmode='fixed'). A .parquet file keeps them as lists of float64,
+exactly as ARC used them: nothing to parse, and not rounded to 6 decimals.
 """
 from __future__ import annotations
 
@@ -13,11 +14,25 @@ from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from arc import LOG
 
 XS_EXPORT_COLUMNS = ['COMID', 'Row', 'Col', 'XS1_Profile', 'Ordinate_Dist', 'Manning_N_Raster1', 'XS2_Profile',
                      'Manning_N_Raster2', 'r1', 'c1', 'r2', 'c2']
+_PROFILES = ('XS1_Profile', 'XS2_Profile')
+_ROUGHNESS = ('Manning_N_Raster1', 'Manning_N_Raster2')
+_PARQUET_SCHEMA = pa.schema([(name, pa.list_(pa.float64()) if name in _PROFILES + _ROUGHNESS
+                              else pa.float64() if name == 'Ordinate_Dist' else pa.int64())
+                             for name in XS_EXPORT_COLUMNS])
+# The elevations' bytes split into streams (their high bytes barely change along a profile) and the n values, which
+# take a few values, dictionary-encoded, then zstd: a 1° tile's 43,000 cross sections take 43 MB, against 131 MB of
+# text. A list's values are addressed by their path, '<column>.list.element'; the bare name is silently ignored.
+_PARQUET_OPTIONS = dict(compression='zstd', compression_level=3,
+                        use_byte_stream_split=[f'{name}.list.element' for name in _PROFILES],
+                        use_dictionary=[name for name in XS_EXPORT_COLUMNS if name not in _PROFILES + _ROUGHNESS]
+                        + [f'{name}.list.element' for name in _ROUGHNESS])
 
 
 class CrossSectionRecord(NamedTuple):
@@ -87,10 +102,33 @@ def cross_section_dataframe(records: list[CrossSectionRecord]) -> pd.DataFrame:
     return df
 
 
+def cross_section_table(records: list[CrossSectionRecord]) -> pa.Table:
+    """The cross-section file's table for Parquet, with the profiles and n as lists of float64."""
+    records = [record for record in records if record is not None]
+    values = zip(*records) if records else [()] * len(XS_EXPORT_COLUMNS)
+    columns = [_list_array(column) if pa.types.is_list(field.type) else pa.array(column, type=field.type)
+               for field, column in zip(_PARQUET_SCHEMA, values)]
+    return pa.Table.from_arrays(columns, schema=_PARQUET_SCHEMA)
+
+
+def _list_array(arrays) -> pa.ListArray:
+    offsets = np.zeros(len(arrays) + 1, dtype=np.int64)
+    np.cumsum(np.fromiter((a.size for a in arrays), dtype=np.int64, count=len(arrays)), out=offsets[1:])
+    values = np.concatenate(arrays).astype(np.float64, copy=False) if arrays else np.empty(0)
+    # int32 offsets, which pa.array refuses to overflow
+    return pa.ListArray.from_arrays(pa.array(offsets, type=pa.int32()), pa.array(values, type=pa.float64()))
+
+
 def write_cross_sections(records: list[CrossSectionRecord], path: os.PathLike) -> pd.DataFrame:
-    """Write the cross-section file, tab-separated, and return its table."""
-    df = cross_section_dataframe(records)
+    """Write the cross-section file, tab-separated or, for a .parquet path, Parquet, and return its table (with the
+    arrays as text or as arrays)."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(path, index=False, sep='\t')
+    if str(path).endswith('.parquet'):
+        table = cross_section_table(records)
+        pq.write_table(table, path, **_PARQUET_OPTIONS)
+        df = table.to_pandas()
+    else:
+        df = cross_section_dataframe(records)
+        df.to_csv(path, index=False, sep='\t')
     LOG.info('Finished writing ' + str(path))
     return df

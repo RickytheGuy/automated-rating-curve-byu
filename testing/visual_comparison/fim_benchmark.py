@@ -11,7 +11,8 @@ with the settings under test (vc_variants). Then every stage of every site is sc
     e.g. python fim_benchmark.py --out runs/fim legacy '{"code": "legacy"}' new '{"code": "new"}'
 
 SETTINGS is JSON: "code" (legacy or new), any vc_variants settings, "yaml" (changes to the ARC input file nencarta
-writes, for either code; the mapper reads the same file) and "objective" (the benchmark's own switches). Each
+writes, for either code; the mapper reads the same file), "objective" (the benchmark's own switches) and "src" (the
+src folder of another ARC to run as legacy, such as a maintainer's branch, e.g. {"code": "legacy", "src": "..."}). Each
 configuration's scores, VDTs and ARC bathymetry go to FOLDER/results/NAME/, and a configuration already scored is
 skipped. The benchmark's tree is only read: it is copied to FOLDER/tree_template once (1.1 GB). Each configuration
 takes about 90 s on 10 workers. ARC's roughness defaults are used (rerun_arc's arguments pass 1s for them, which
@@ -57,6 +58,11 @@ CONFIGURATIONS = {
     "new_td10": {"code": "new", "test_depth": 10.0},
     "new_nosearch": {"code": "new", "yaml": {"Degree_Manip": 0}},
     "new_cap001": {"code": "new", "bed_grade": 0.01},
+    "new_depth_n003": {"code": "new", "depth_n": 0.03},  # legacy's fixed n for the channel's depth
+    # the ground beyond a narrow channel's bank top running level to the DEM's own bank (vc_shelf, an experiment):
+    # on power-law channels, as the user put it, and on every channel the DEM shows wider
+    "new_bank_shelf": {"code": "new", "bank_shelf": True},
+    "new_bank_shelf_all": {"code": "new", "bank_shelf": "all"},
     "new_nocap": {"code": "new", "bed_grade": None},
     # the bank elevation: legacy's smoothing, alone and with fixes, and the other smoothings tried
     "new_legacy_smoothing": {"code": "new", "bank_smoothing": "legacy"},
@@ -74,6 +80,8 @@ CONFIGURATIONS = {
     # the cross section pivoting as the rating curve rises (vc_pivot): at every increment, or once at the top
     "new_pivot": {"code": "new", "pivot": "each"},
     "new_pivot_top": {"code": "new", "pivot": "top"},
+    # Joseph Gutenson's bank smoothing (his branch varying_roughness_and_slope, 187eb40) in the new code
+    "new_joseph_smoothing": {"code": "new", "bank_reference": "joseph_monotone"},
 }
 
 
@@ -95,8 +103,9 @@ def run_arc(config_path: str, settings: dict, quiet: bool = True) -> None:
         with open(config_path, "w") as f:
             yaml.safe_dump(inputs, f, sort_keys=False)
     if settings.get("code", "new") == "legacy":
-        from arc import Arc
-        Arc(config_path, quiet=quiet).run()
+        # legacy ARC's own entry point: arc.Arc runs the new pipeline since 526553b. With "src", another ARC's
+        from arc.Automated_Rating_Curve_Generator import main
+        main(config_path, {}, quiet, 1)
         return
     import vc_variants
     from arc import pipeline
@@ -107,9 +116,11 @@ def run_arc(config_path: str, settings: dict, quiet: bool = True) -> None:
 
 
 def _worker_init(settings_json: str) -> None:
+    settings = json.loads(settings_json)
+    if settings.get("src"):  # another ARC's source, such as a maintainer's branch, ahead of this repository's
+        sys.path.insert(0, settings["src"])
     if str(HERE) not in sys.path:
         sys.path.insert(0, str(HERE))
-    settings = json.loads(settings_json)
     import nencarta.tasks.run_models as run_models
 
     def _run_arc(config, model_config):
@@ -172,7 +183,8 @@ def prepare(out: Path, tree: Path) -> None:
             f.unlink()
 
 
-def evaluate(out: Path, name: str, settings: dict, workers: int = 10, dem_glob: str = DEMS, maps=MAPS) -> Path:
+def evaluate(out: Path, name: str, settings: dict, workers: int = 10, dem_glob: str = DEMS, maps=MAPS,
+             thesis: Path = THESIS) -> Path:
     import pandas as pd
     out = out.resolve()  # the objective runs from inside it
     results = out / "results" / name
@@ -186,6 +198,7 @@ def evaluate(out: Path, name: str, settings: dict, workers: int = 10, dem_glob: 
 
     sys.path.insert(0, str(THESIS))
     sys.path.insert(0, str(AUDIT))
+    sys.path.insert(0, str(thesis))  # the objective's own folder, or a copy of it (--thesis)
     from optimieze_linux_based import _objective
     from rerun_arc import ARGS
     args = dict(ARGS)
@@ -226,7 +239,7 @@ def evaluate(out: Path, name: str, settings: dict, workers: int = 10, dem_glob: 
     return results
 
 
-def save_maps(out: Path, name: str, settings: dict, workers: int = 4, maps=MAPS) -> None:
+def save_maps(out: Path, name: str, settings: dict, workers: int = 4, maps=MAPS, thesis: Path = THESIS) -> None:
     """Rebuild just the MAPS sites with a configuration and keep their flood maps, for the figures (the whole
     benchmark's run keeps them too)."""
     out = out.resolve()
@@ -236,6 +249,7 @@ def save_maps(out: Path, name: str, settings: dict, workers: int = 4, maps=MAPS)
     prepare(out, tree)
     sys.path.insert(0, str(THESIS))
     sys.path.insert(0, str(AUDIT))
+    sys.path.insert(0, str(thesis))  # the objective's own folder, or a copy of it (--thesis)
     from optimieze_linux_based import _objective
     from rerun_arc import ARGS
     args = dict(ARGS)
@@ -259,6 +273,8 @@ def main(argv=None) -> None:
     parser.add_argument("--dems", default=DEMS, help="a glob of the sites' DEMs, to run fewer")
     parser.add_argument("--maps-only", action="store_true", help="only rebuild the mapped sites and keep their maps")
     parser.add_argument("--all", action="store_true", help="every configuration the figures use (CONFIGURATIONS)")
+    parser.add_argument("--thesis", type=Path, default=THESIS,
+                        help="the folder to import the thesis's optimieze_linux_based._objective from, such as a copy")
     parser.add_argument("runs", nargs="*", help="NAME SETTINGS pairs")
     args = parser.parse_args(argv)
     if len(args.runs) % 2 or not (args.runs or args.all):
@@ -268,9 +284,9 @@ def main(argv=None) -> None:
         runs += list(CONFIGURATIONS.items())
     for name, settings in runs:
         if args.maps_only:
-            save_maps(args.out, name, settings)
+            save_maps(args.out, name, settings, thesis=args.thesis)
         else:
-            evaluate(args.out, name, settings, args.workers, args.dems)
+            evaluate(args.out, name, settings, args.workers, args.dems, thesis=args.thesis)
 
 
 if __name__ == "__main__":

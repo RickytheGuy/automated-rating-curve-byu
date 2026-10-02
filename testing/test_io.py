@@ -116,7 +116,8 @@ def test_bounds_intersect() -> None:
 
 
 def test_writing_a_raster_matches_legacy_s_file(tmp_path: Path) -> None:
-    """The same values, grid and compression (LZW with horizontal differencing) as legacy write_output_raster."""
+    """The same values and grid as legacy write_output_raster, compressed with ZSTD in 512 × 512 tiles without a
+    predictor, where legacy used LZW in strips with horizontal differencing."""
     reference = Raster(write_raster(tmp_path / "dem.tif", np.ones((40, 30), np.float32), PROJECTED, 32616))
     values = np.random.default_rng(1).normal(100, 5, (40, 30)).astype(np.float32)
     values[3:7, 4:9] = np.nan
@@ -129,10 +130,28 @@ def test_writing_a_raster_matches_legacy_s_file(tmp_path: Path) -> None:
     assert np.array_equal(new.ReadAsArray(), legacy.ReadAsArray(), equal_nan=True)
     assert new.GetGeoTransform() == legacy.GetGeoTransform()
     assert new.GetProjection() == legacy.GetProjection()
-    for key in ("COMPRESSION", "PREDICTOR"):
-        assert new.GetMetadata("IMAGE_STRUCTURE").get(key) == legacy.GetMetadata("IMAGE_STRUCTURE").get(key)
+    structure = new.GetMetadata("IMAGE_STRUCTURE")
+    assert structure.get("COMPRESSION") == "ZSTD" and "PREDICTOR" not in structure
+    assert legacy.GetMetadata("IMAGE_STRUCTURE").get("PREDICTOR") == "2"
+    assert new.GetRasterBand(1).GetBlockSize() == [512, 512]
     assert new.GetRasterBand(1).GetNoDataValue() is None
     new = legacy = None
+
+
+@pytest.mark.parametrize("compression", ["LZW", "DEFLATE", "LZMA"])
+def test_any_compressed_raster_is_tiled_without_a_predictor(tmp_path: Path, compression: str) -> None:
+    reference = Raster(write_raster(tmp_path / "dem.tif", np.ones((40, 30), np.float32), PROJECTED, 32616))
+    values = np.full((40, 30), np.nan, np.float32)
+    values[10:12, 5:20] = 97.25
+
+    written = Raster.write_array(values, reference, tmp_path / "bathymetry.tif", compression=compression.lower())
+
+    ds = gdal.Open(str(written.filepath))
+    structure = ds.GetMetadata("IMAGE_STRUCTURE")
+    assert structure.get("COMPRESSION") == compression and "PREDICTOR" not in structure
+    assert ds.GetRasterBand(1).GetBlockSize() == [512, 512]
+    ds = None
+    assert np.array_equal(written.read_array(), values, equal_nan=True)
 
 
 def test_writing_a_raster_with_nodata_and_other_compressions(tmp_path: Path) -> None:
@@ -143,6 +162,9 @@ def test_writing_a_raster_with_nodata_and_other_compressions(tmp_path: Path) -> 
 
     assert written.dtype == np.uint8 and written.nodata_value == 255
     assert np.array_equal(written.read_array(), flood)
+    ds = gdal.Open(str(written.filepath))
+    assert ds.GetRasterBand(1).GetBlockSize()[0] == 5  # uncompressed rasters stay in strips, unpadded
+    ds = None
     with pytest.raises(ValueError, match="reference raster"):
         Raster.write_array(np.zeros((3, 3)), reference, tmp_path / "wrong.tif")
 

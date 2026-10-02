@@ -466,7 +466,9 @@ def channel_depths(ctx):
     ax.set_title(f"a channel one cell wide, {spacing:g} m spacing, slope {slope:g}", fontsize=8.5)
     ax.legend(loc="upper left", fontsize=6.8)
     return fig, dict(caption=(
-        "The depth at which the channel carries its baseflow by Manning's equation (n = 0.03, legacy's fixed value). "
+        "The depth at which the channel carries its baseflow by Manning's equation, both codes at n = 0.03, legacy's "
+        "fixed value (since 526553b the new code solves it with the water class's n from the Manning's n table, the n "
+        "the channel has between its banks). "
         "Left: legacy stepped the depth by 1 m, 0.5 m, 0.1 m and 1 cm, stopping a step short of the answer, so its "
         "trapezoids came out up to a centimetre shallow; the new depth is solved exactly. Right: a single cell. "
         "Legacy's was a triangle from the stream cell out to the neighbouring ordinates, stepped 10 cm at a time, and "
@@ -1028,7 +1030,8 @@ def bank_elevations_along_reach(ctx):
 def _smooth_made_up(thalweg, observations, cell=30.0, phantom=False, width=60.0, method="water_plus_height"):
     """The bank smoothing on a made-up reach of cross sections one cell apart along a row, flowing into a
     reach with one cross section beyond its end (so its downstream end is known), and with phantom an inflow with no
-    cross sections of its own. Every channel is the same width, so the width filter leaves the banks alone."""
+    cross sections of its own. Every channel is the same width, so the width filter leaves the banks alone. method is
+    smooth_bank_elevations' method, or a smoothing of its own, called as smooth_bank_elevations is."""
     import networkx as nx
     from arc.bathymetry import Banks, ReachSections, smooth_bank_elevations
     from arc.xsection.xsection import XSection
@@ -1054,6 +1057,8 @@ def _smooth_made_up(thalweg, observations, cell=30.0, phantom=False, width=60.0,
     reaches = {1: ReachSections(np.zeros(count, np.int64), np.arange(count), [section(z) for z in thalweg],
                                 [banks(z) for z in observations]),
                2: ReachSections(np.zeros(1, np.int64), np.array([count]), [section(last)], [banks(last)])}
+    if callable(method):  # another smoothing, such as vc_variants.joseph_smoothing
+        return method(network, reaches, cell, cell)[1]
     return smooth_bank_elevations(network, reaches, cell, cell, method=method)[1]
 
 
@@ -1112,6 +1117,20 @@ def bank_smoothing_synthetic(ctx):
         "below their centre, but it never goes below the water."), stats=stats)
 
 
+LEGACY_DEM_RAISE = 100.0  # legacy raised a DEM with any elevation below 0 by this much (arc.rating_curve's notes)
+
+
+def legacy_offset(capture) -> float:
+    """How far a legacy-style capture's bank elevations are above its sampled ground's frame: legacy raised a DEM with
+    any elevation below 0 (such as a nodata value read as data, S6) by LEGACY_DEM_RAISE, and its bank elevations are
+    in that raised frame, where the ground it samples isn't. No bank is tens of metres above its stream cell, so a
+    median raw bank that far up is the raise."""
+    cells = [c for c in capture["cells"] if c is not None]
+    heights = np.array([c["banks"].get("raw_bank_elevation", np.nan) - c["found"][0][0] for c in cells], float)
+    heights = heights[np.isfinite(heights)]
+    return LEGACY_DEM_RAISE if heights.size and np.median(heights) > LEGACY_DEM_RAISE / 2 else 0.0
+
+
 def _rebuilt_reaches(ctx, site):
     """The site's ReachSections as the new pipeline smoothed them (from the capture), and its network."""
     from arc import pipeline
@@ -1165,7 +1184,8 @@ def bank_elevation_real(ctx):
         heights["legacy_method"].append(values)
         mine = np.concatenate(with_new) if with_new else np.empty(0)
         heights["new"].append(mine[np.isfinite(mine)])
-        old = np.array([c["banks"].get("smoothed_bank_elevation", np.nan) - c["found"][0][0]
+        raise_ = 0.0 if legacy is None else legacy_offset(legacy)
+        old = np.array([c["banks"].get("smoothed_bank_elevation", np.nan) - raise_ - c["found"][0][0]
                         for c in ([] if legacy is None else legacy["cells"]) if c is not None])
         heights["legacy"].append(old[np.isfinite(old)])
         shares.append((site, float(np.mean(values < 0)) if values.size else np.nan,
@@ -1396,7 +1416,8 @@ def carved_beds(ctx):
     stats["sites_all_filled"] = [r[0] for r in shares if r[2] >= 0.999]
     return fig, dict(caption=(
         "Where each smoothing leaves the carved bed, the smoothed bank elevation less the channel's depth after the "
-        "bed smoothing, against the DEM's water at the stream cell, over the carved cross sections of the 51 sites "
+        f"bed smoothing, against the DEM's water at the stream cell, over the carved cross sections of the {len(shares)} "
+        "sites "
         "(all three from the new code's cross sections and depths). Legacy's smoothing ran the bank elevation along "
         f"the reach's lowest banks and often under the water, so the bed was more than 2 m under the water at "
         f"{legacy['below_2m']:.0%} of cross sections. The new one puts it at the water plus the 10th percentile of "

@@ -15,7 +15,8 @@ from numba.core.errors import TypingError
 from scipy.optimize import curve_fit
 
 from arc import LOG
-from arc.outputs.rating_curves import Q, T, V, WSE, RatingCurves, _write_table
+from arc.outputs.rating_curves import Q, T, V, WSE, RatingCurves
+from arc.outputs.tables import write_table
 
 FAILED_FIT = -9999.9  # legacy's coefficient, power and R² when a fit fails
 # Initial guesses for a and b, as legacy ARC made them
@@ -135,7 +136,7 @@ def reach_average_curve_file_dataframe(curves: RatingCurves, vdt_df: pd.DataFram
 def write_curve_file(curves: RatingCurves, qmax: pd.Series, path: os.PathLike) -> pd.DataFrame:
     """Write each cell's power laws, as CSV or, for a .parquet path, Parquet, and return them."""
     df = curve_file_dataframe(curves, qmax)
-    _write_table(df, path)
+    write_table(df, path)
     LOG.info('Finished writing ' + str(path))
     return df
 
@@ -144,6 +145,6 @@ def write_reach_average_curve_file(curves: RatingCurves, vdt_df: pd.DataFrame, q
                                    path: os.PathLike) -> pd.DataFrame:
     """Write each reach's power laws with its cells' metadata, as CSV or Parquet, and return them."""
     df = reach_average_curve_file_dataframe(curves, vdt_df, qmax)
-    _write_table(df, path)
+    write_table(df, path)
     LOG.info('Finished writing ' + str(path))
     return df

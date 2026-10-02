@@ -18,7 +18,7 @@ gdal.UseExceptions()
 
 _METRES = {"metre", "metres", "meter", "meters"}
 _DEGREES = {"degree", "degrees"}
-_PREDICTED_COMPRESSIONS = {"LZW", "DEFLATE", "ZSTD", "LZMA"}  # the compressions GTiff's PREDICTOR works with
+_TILE = 512  # the side of a compressed raster's tiles, in cells
 
 
 class Raster:
@@ -180,12 +180,15 @@ class Raster:
 
     @classmethod
     def write_array(cls, array: np.ndarray, reference: Raster, output_path: os.PathLike, *,
-                    dtype: np.dtype | type | None = None, compression: str | None = "LZW",
+                    dtype: np.dtype | type | None = None, compression: str | None = "ZSTD",
                     nodata_value: float | None = None) -> Raster:
         """Write a single-band GeoTIFF on the reference raster's grid, and return it.
 
-        LZW, DEFLATE, ZSTD and LZMA compression use horizontal differencing (PREDICTOR=2), as legacy ARC wrote its
-        rasters. A nodata value is only set if given.
+        A compressed raster is written in 512x512 tiles, without a predictor. ARC's bathymetry and flood rasters are
+        almost all empty, and tiles hand the compressor whole empty blocks. Horizontal differencing (PREDICTOR=2),
+        which legacy ARC used with LZW, made them bigger with every compression once tiled. On the N14W089 tile, ZSTD
+        in tiles takes the bathymetry from legacy's 1.10 MB to 0.22 MB and the flood cells from 0.33 MB to 0.06 MB,
+        written and read as fast. A nodata value is only set if given.
         """
         array = np.asarray(array)
         if array.shape != reference.shape:
@@ -198,9 +201,7 @@ class Raster:
             driver.Delete(str(output_path))
         options = []
         if compression and compression.upper() != "NONE":
-            options.append(f"COMPRESS={compression.upper()}")
-            if compression.upper() in _PREDICTED_COMPRESSIONS:
-                options.append("PREDICTOR=2")
+            options += [f"COMPRESS={compression.upper()}", "TILED=YES", f"BLOCKXSIZE={_TILE}", f"BLOCKYSIZE={_TILE}"]
         ds = driver.Create(str(output_path), xsize=array.shape[1], ysize=array.shape[0], bands=1,
                            eType=gdal_array.NumericTypeCodeToGDALTypeCode(dtype), options=options)
         ds.SetGeoTransform(reference.geotransform)

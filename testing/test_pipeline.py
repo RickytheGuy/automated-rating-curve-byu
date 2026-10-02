@@ -279,11 +279,13 @@ def test_the_drainage_area_depth_is_carved_as_it_is(tmp_path: Path) -> None:
         assert depth == pytest.approx(target, abs=0.01)
 
 
-def test_representative_cross_sections(tmp_path: Path) -> None:
+@pytest.mark.parametrize("suffix", [".csv", ".parquet"])
+def test_representative_cross_sections(tmp_path: Path, suffix: str) -> None:
+    path = tmp_path / f"representative{suffix}"
     inputs = {**write_channel(tmp_path), "Build_Representative_Cross_Section": True,
-              "Representative_Cross_Section_File": str(tmp_path / "representative.csv")}
+              "Representative_Cross_Section_File": str(path)}
     results = pipeline.run(Configs.from_mapping(inputs), quiet=True)
-    df = pd.read_csv(tmp_path / "representative.csv")
+    df = pd.read_parquet(path) if suffix == ".parquet" else pd.read_csv(path)
 
     assert results.curves is None and not (tmp_path / "vdt.csv").exists()
     assert sorted(df["COMID"].unique()) == [11, 12]
@@ -423,6 +425,21 @@ def test_the_cross_section_file_numbers_the_sides_as_legacy_did(tmp_path: Path) 
         xs1 = parse(row["XS1_Profile_new"])
         assert xs1[6] - xs1[5] == pytest.approx(1.0)  # the steep side
         assert row["r1_new"] == ROWS - 1 and row["c1_new"] == row["Col"]
+
+
+def test_the_cross_section_file_can_be_parquet(tmp_path: Path) -> None:
+    """A .parquet XS_Out_File holds each cross section's profiles and n as the arrays the run used."""
+    inputs = {**write_channel(tmp_path), "XS_Out_File": str(tmp_path / "xs.parquet")}
+    results = pipeline.run(Configs.from_mapping(inputs), quiet=True)
+    xs = pd.read_parquet(tmp_path / "xs.parquet")
+
+    assert len(xs) == len(results.cross_sections) == results.cells.count
+    for record, (_, row) in zip(results.cross_sections, xs.iterrows()):
+        assert (row["COMID"], row["Row"], row["Col"], row["r1"], row["c2"]) == \
+            (record.comid, record.row, record.col, record.r1, record.c2)
+        for column, values in (("XS1_Profile", record.xs1_profile), ("Manning_N_Raster1", record.manning_n_raster1),
+                               ("XS2_Profile", record.xs2_profile), ("Manning_N_Raster2", record.manning_n_raster2)):
+            assert np.array_equal(row[column], values)
 
 
 def test_without_bank_elevations_the_bathymetry_never_rises_above_the_dem(tmp_path: Path) -> None:

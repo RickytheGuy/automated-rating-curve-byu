@@ -17,7 +17,6 @@ Numerical differences
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import NamedTuple, Sequence
 
 import numpy as np
@@ -25,6 +24,7 @@ import pandas as pd
 
 from arc import LOG
 from arc.hydraulics import DepthRoughness, _check_roughness, _check_slope_factor, hydraulic_profile
+from arc.outputs.tables import write_table
 from arc.xsection.xsection import Profile, XSection
 
 DEPTH_INCREMENT = 0.10  # metres between stages
@@ -198,13 +198,16 @@ def representative_cross_section_dataframe(samples: Sequence[RepresentativeSampl
 
 
 def write_representative_cross_sections(df: pd.DataFrame | None, path: os.PathLike) -> pd.DataFrame:
-    """Write the representative cross sections as CSV, rounded to 6 decimals (legacy
-    save_representative_cross_section_file)."""
-    df = pd.DataFrame(columns=REPRESENTATIVE_CROSS_SECTION_COLUMNS) if df is None else df.copy()
-    if not df.empty:
+    """Write the representative cross sections rounded to 6 decimals (legacy save_representative_cross_section_file),
+    as CSV or, for a .parquet path, Parquet (arc.outputs.tables), and return them."""
+    if df is None or df.empty:
+        # typed, so that an empty Parquet file still has integer and float columns
+        df = pd.DataFrame({col: pd.Series(dtype=np.int64 if col in _INTEGER_COLUMNS else np.float64)
+                           for col in REPRESENTATIVE_CROSS_SECTION_COLUMNS})
+    else:
+        df = df.copy()
         numeric = [c for c in df.columns if c not in _INTEGER_COLUMNS]
         df[numeric] = df[numeric].round(6)
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(path, index=False)
+    write_table(df, path)
     LOG.info('Finished writing ' + str(path))
     return df

@@ -5,7 +5,7 @@ dependencies:
   - python
   - numpy
   - pandas
-  - fastparquet
+  - pyarrow
   - geopandas
   - gdal
   - pip

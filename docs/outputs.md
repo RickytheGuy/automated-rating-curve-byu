@@ -1,6 +1,8 @@
 # Outputs
 ARC can write several outputs depending on which output paths are provided in the MIF. If an output path is blank, ARC skips generating that output.
 
+Tables whose path ends in `.parquet` are written as parquet, compressed with brotli (level 5), with dictionary encoding only on the columns where fewer than 30% of the values differ. That keeps the files about a fifth smaller than pyarrow's defaults, with the same columns and values. Rasters are GeoTIFFs compressed with ZSTD in 512 × 512 tiles. Set `Compression` to change the codec, for example to `DEFLATE` for tools built without ZSTD.
+
 ## VDT database
 The VDT output is a per-stream-cell table of hydraulic variables by increment (e.g., discharge, velocity, top width, WSE). It is commonly used downstream for inundation mapping workflows. It may be saved as a CSV or as a parquet. The following table details the columns in the VDT database.
 
@@ -66,7 +68,7 @@ The depth written to the raster is a reach-level value, not necessarily the init
 
 
 ## Cross section export
-If the cross section output is enabled, ARC writes a tab-delimited text file containing the cross-section profiles and the associated metadata used during computation.
+If the cross section output is enabled, ARC writes a tab-delimited text file containing the cross-section profiles and the associated metadata used during computation. If `XS_Out_File` ends in `.parquet`, ARC writes a parquet file with the same columns instead. There the profiles and Manning's *n* are lists of 64-bit floats, exactly as ARC used them, so they don't need parsing and aren't rounded. The parquet file is about a third the size of the text file. It uses the `BYTE_STREAM_SPLIT` encoding, which pyarrow, pandas, polars and DuckDB read but fastparquet does not.
 
 ARC now builds these sections in stages. It first samples every stream-cell cross section, applies the low-spot recentering and any optional angle-based resampling, evaluates reach-scale INFLECT and the remaining bank-finding hierarchy across the cached sections, and then applies bathymetry if requested. The exported `XS_Out_File`, if requested, reflects the final section ARC actually used during the run.
 
@@ -79,19 +81,18 @@ The following table details the columns in the cross section export file:
 | COMID | String | The unique identifier for the simulated row. In standard raster-sampled runs this is the stream/reach ID. In manual-cross-section runs it is the manual cross-section ID from `Flow_File_ID`. |
 | Row | Integer | The row in the DEM where the stream cell is located. |
 | Col | Integer | The column in the DEM where the stream cell is located. |
-| XS1_Profile | String | A string representation of one half of the cross-section profile. It is a list of elevation values, rounded to 6 decimal places. |
+| XS1_Profile | String (list of floats in parquet) | One half of the cross-section profile: its elevation values, starting at the stream cell. In the text file it is printed with 6 decimal places. |
 | Ordinate_Dist | Float | The distance between each elevation value in the cross-section profile, in meters. |
-| Manning_N_Raster1 | String | A string representation of the Manning's n values for the land cover types corresponding to each elevation value in the cross-section profile. It is a list of values, rounded to 6 decimal places. |
-| XS2_Profile | String | A string representation of the other half of the cross-section profile. It is a list of elevation values, rounded to 6 decimal places. |
-| Manning_N_Raster2 | String | A string representation of the Manning's n values for the land cover types corresponding to each elevation value in the cross-section profile. It is a list of values, rounded to 6 decimal places. |
+| Manning_N_Raster1 | String (list of floats in parquet) | The Manning's n values for the land cover types corresponding to each elevation value in `XS1_Profile`. In the text file it is printed with 6 decimal places. |
+| XS2_Profile | String (list of floats in parquet) | The other half of the cross-section profile: its elevation values, starting at the stream cell. In the text file it is printed with 6 decimal places. |
+| Manning_N_Raster2 | String (list of floats in parquet) | The Manning's n values for the land cover types corresponding to each elevation value in `XS2_Profile`. In the text file it is printed with 6 decimal places. |
 | r1 | Integer | The row representing the farthest point in the first side of the cross-section. |
 | c1 | Integer | The column representing the farthest point in the first side of the cross-section. |
 | r2 | Integer | The row representing the farthest point in the second side of the cross-section. |
 | c2 | Integer | The column representing the farthest point in the second side of the cross-section. |
-| Inflect_D2W_Dy2 | String | A string representation of the raw sampled cross section's INFLECT `d2W/dy^2` curve. This curve is computed before bathymetry is applied and is the diagnostic signal ARC uses to build reach-average INFLECT bank and terrace indices. |
 
 ## Representative cross section export
-If `Build_Representative_Cross_Section` is `True`, ARC writes a comma-separated CSV file that summarizes the sampled cross sections belonging to each positive reach ID in `Stream_File`. Representative grouping does not depend on `Flow_File_ID` or `Flow_File_QMax`.
+If `Build_Representative_Cross_Section` is `True`, ARC writes a comma-separated CSV file, or a parquet file if `Representative_Cross_Section_File` ends in `.parquet`, that summarizes the sampled cross sections belonging to each positive reach ID in `Stream_File`. Representative grouping does not depend on `Flow_File_ID` or `Flow_File_QMax`.
 
 ARC first samples and caches every stream-cell cross section, including its final profile, Manning's *n* arrays, slope, and thalweg. If `AROutBATHY` or `BATHY_Out_File` is configured, ARC completes bank finding and bathymetry preprocessing before building the representative output. Complete `Flow_File`, `Flow_File_ID`, and `Flow_File_BF` inputs select baseflow-driven bathymetry in representative mode. Otherwise, ARC uses the complete drainage-area power-law configuration when one is supplied. If neither bathymetry output path is configured, bathymetry estimation and excavation are bypassed and the representative hydraulics use the unexcavated sampled profiles.
 

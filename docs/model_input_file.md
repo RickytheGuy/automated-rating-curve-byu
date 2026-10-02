@@ -89,11 +89,12 @@ See [**Outputs**](outputs.md) documentation for details on the output datasets t
 | --- | --- | --- | --- |
 | `AROutBATHY` | --- | str | Path to the output bathymetry raster file. |
 | `BATHY_Out_File` | --- | str | The same as `AROutBATHY`, which takes precedence. |
+| `Compression` | ZSTD | str | The output rasters' GeoTIFF compression: ZSTD, DEFLATE, LZW, LZMA or NONE. Compressed rasters are written in 512 × 512 tiles. |
 | `Print_AP_Database` | --- | str | Path to the output Area/Perimeter (AP) database file. |
 | `Print_Curve_File` | --- | str | Path to the output curve file. |
 | `Print_VDT_Database` | --- | str | Path to the output VDT database file. |
-| `Representative_Cross_Section_File` | --- | str | Path to the output representative cross-section CSV file. This file is only written when `Build_Representative_Cross_Section` is `True`. It stores one row per reach and successful 0.10 m stage, up to 25 m or the first stage that produces a non-finite area, wetted perimeter, velocity, discharge, or top width. Each row includes `Stream_Slope`, the reach-mean positive stream slope from the sampled cross sections. |
-| `XS_Out_File` | --- | str | Path to the output cross-section export file. |
+| `Representative_Cross_Section_File` | --- | str | Path to the output representative cross-section file: CSV, or parquet if the path ends in `.parquet`. This file is only written when `Build_Representative_Cross_Section` is `True`. It stores one row per reach and successful 0.10 m stage, up to 25 m or the first stage that produces a non-finite area, wetted perimeter, velocity, discharge, or top width. Each row includes `Stream_Slope`, the reach-mean positive stream slope from the sampled cross sections. |
+| `XS_Out_File` | --- | str | Path to the output cross-section export file: tab-delimited text, or parquet if the path ends in `.parquet`. |
 
 ## Manual Cross-Section Input Schema
 
